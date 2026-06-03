@@ -1,7 +1,3 @@
-// TODO
-// - Have the tape as Rc<Refcell<T>> on Value
-// - Vector type that implements dot, softmax, rmsnorm
-
 use rand::distributions::Distribution;
 use rand::thread_rng;
 use rand::{distributions::Uniform, seq::SliceRandom};
@@ -45,26 +41,23 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct Value {
     // Output of the forward pass
     data: f64,
     // Gradient accumulated during the backward pass.
     // How much nudging this value affects the final loss
     grad: f64,
-    // Inputs for this value
-    children: Vec<usize>,
-    // How changing each input affects this value
-    local_grads: Vec<f64>,
+    // Input position and grad for this value
+    inputs: [Option<(usize, f64)>; 2],
 }
 
 impl Value {
-    fn new(data: f64, children: Vec<usize>, local_grads: Vec<f64>) -> Self {
+    fn new(data: f64, inputs: [Option<(usize, f64)>; 2]) -> Self {
         Self {
             data,
             grad: 0.0,
-            children,
-            local_grads,
+            inputs,
         }
     }
 }
@@ -86,11 +79,10 @@ impl Tape {
 
         for i in (0..n).rev() {
             let v = self.values[i].clone();
-            for j in 0..v.children.len() {
-                let child_i = v.children[j];
-                let local_grad = v.local_grads[j];
-
-                self.values[child_i].grad += local_grad * v.grad;
+            for input in v.inputs {
+                if let Some((j, grad)) = input {
+                    self.values[j].grad += grad * v.grad;
+                }
             }
         }
     }
@@ -107,10 +99,8 @@ impl Tape {
     }
 
     fn softmax(&mut self, x: &[usize]) -> Vec<usize> {
-        let max = x
-            .iter()
-            .map(|&i| self.values[i].data)
-            .fold(0.0f64, f64::max);
+        let data = x.iter().map(|&i| self.values[i].data);
+        let max = data.fold(0.0f64, f64::max);
         let neg_max = self.value(-max);
 
         let mut exps = vec![];
@@ -132,51 +122,47 @@ impl Tape {
     }
 
     fn value(&mut self, data: f64) -> usize {
-        self.push(Value::new(data, vec![], vec![]))
+        self.push(Value::new(data, [None, None]))
     }
 
     fn add(&mut self, a: usize, b: usize) -> usize {
         let data = self.values[a].data + self.values[b].data;
-        self.push(Value::new(data, vec![a, b], vec![1.0, 1.0]))
+        self.push(Value::new(data, [Some((a, 1.0)), Some((b, 1.0))]))
     }
 
     fn mul(&mut self, a: usize, b: usize) -> usize {
-        let local_grads = vec![self.values[b].data, self.values[a].data];
         let data = self.values[a].data * self.values[b].data;
-        self.push(Value::new(data, vec![a, b], local_grads))
+        let left = Some((a, self.values[b].data));
+        let right = Some((b, self.values[a].data));
+        self.push(Value::new(data, [left, right]))
     }
 
     fn neg(&mut self, i: usize) -> usize {
-        self.push(Value::new(-1.0, vec![], vec![]));
+        self.push(Value::new(-1.0, [None, None]));
         self.mul(i, self.values.len() - 1)
     }
 
     fn pow(&mut self, i: usize, n: f64) -> usize {
-        let local_grads = vec![n * self.values[i].data.powf(n - 1.0)];
-        self.push(Value::new(
-            self.values[i].data.powf(n),
-            vec![i],
-            local_grads,
-        ))
+        let grad = n * self.values[i].data.powf(n - 1.0);
+        let inputs = [Some((i, grad)), None];
+        self.push(Value::new(self.values[i].data.powf(n), inputs))
     }
 
     fn log(&mut self, i: usize) -> usize {
-        let local_grads = vec![1.0 / self.values[i].data];
-        self.push(Value::new(self.values[i].data.ln(), vec![i], local_grads))
+        let grad = 1.0 / self.values[i].data;
+        let inputs = [Some((i, grad)), None];
+        self.push(Value::new(self.values[i].data.ln(), inputs))
     }
 
     fn exp(&mut self, i: usize) -> usize {
         let data = self.values[i].data.exp();
-        self.push(Value::new(data, vec![i], vec![data]))
+        self.push(Value::new(data, [Some((i, data)), None]))
     }
 
     fn relu(&mut self, i: usize) -> usize {
-        let local_grads = vec![if self.values[i].data > 0.0 { 1.0 } else { 0.0 }];
-        self.push(Value::new(
-            self.values[i].data.max(0.0),
-            vec![i],
-            local_grads,
-        ))
+        let grad = if self.values[i].data > 0.0 { 1.0 } else { 0.0 };
+        let inputs = [Some((i, grad)), None];
+        self.push(Value::new(self.values[i].data.max(0.0), inputs))
     }
 }
 
@@ -297,7 +283,7 @@ impl Gpt {
                 let h_end = h_start + HEAD_DIM;
                 let q_head = &q[h_start..h_end];
 
-                // The dot product between the query and all keys determines how 
+                // The dot product between the query and all keys determines how
                 // relevant each token is to the query. Scale to make variance roughly 1.
                 let scale = tape.value(1.0 / (HEAD_DIM as f64).powf(0.5));
                 let attn_logits = Vec::from_iter((0..n_ctx).map(|t| {
