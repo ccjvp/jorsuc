@@ -7,17 +7,17 @@ use std::{
     vec,
 };
 
-const N_EMBED: usize = 32; // embedding dimension
+const N_EMBED: usize = 16; // embedding dimension
 const N_HEAD: usize = 4; // Number of attention heads
-const N_LAYER: usize = 2; // number of layers
+const N_LAYER: usize = 1; // number of layers
 const BLOCK_SIZE: usize = 16; // Context window
 const HEAD_DIM: usize = N_EMBED / N_HEAD;
-const TRAINING_STEPS: usize = 1_000;
-const N_SAMPLES: usize = 24;
-const LEARNING_RATE: f64 = 0.01;
-const BETA_1: f64 = 0.85;
-const BETA_2: f64 = 0.99;
-const EPS_ADAM: f64 = 1e-8;
+const TRAINING_STEPS: usize = 1000;
+const N_SAMPLES: usize = 1;
+const LEARNING_RATE: f32 = 0.01;
+const BETA_1: f32 = 0.85;
+const BETA_2: f32 = 0.99;
+const EPS_ADAM: f32 = 1e-8;
 
 fn main() -> std::io::Result<()> {
     let file = fs::File::open("input.txt")?;
@@ -54,16 +54,16 @@ fn main() -> std::io::Result<()> {
 #[derive(Clone, Copy)]
 struct Value {
     // Output of the forward pass
-    data: f64,
+    data: f32,
     // Gradient accumulated during the backward pass.
     // How much nudging this value affects the final loss
-    grad: f64,
+    grad: f32,
     // Input position and grad for this value
-    inputs: [Option<(usize, f64)>; 2],
+    inputs: [Option<(usize, f32)>; 2],
 }
 
 impl Value {
-    fn new(data: f64, inputs: [Option<(usize, f64)>; 2]) -> Self {
+    fn new(data: f32, inputs: [Option<(usize, f32)>; 2]) -> Self {
         Self {
             data,
             grad: 0.0,
@@ -104,7 +104,7 @@ impl Tape {
             sum = self.add(sum, i);
         }
 
-        let inv_n = self.value(1.0 / x.len() as f64);
+        let inv_n = self.value(1.0 / x.len() as f32);
         let mean = self.mul(sum, inv_n);
         let scale = self.pow(mean, -0.5);
         Vec::from_iter(x.iter().map(|&v| self.mul(v, scale)))
@@ -112,7 +112,7 @@ impl Tape {
 
     fn softmax(&mut self, x: &[usize]) -> Vec<usize> {
         let data = x.iter().map(|&i| self.values[i].data);
-        let max = data.reduce(f64::max).unwrap();
+        let max = data.reduce(f32::max).unwrap();
         let neg_max = self.value(-max);
 
         let mut exps = vec![];
@@ -133,7 +133,7 @@ impl Tape {
         self.values.len() - 1
     }
 
-    fn value(&mut self, data: f64) -> usize {
+    fn value(&mut self, data: f32) -> usize {
         self.push(Value::new(data, [None, None]))
     }
 
@@ -154,7 +154,7 @@ impl Tape {
         self.mul(i, self.values.len() - 1)
     }
 
-    fn pow(&mut self, i: usize, n: f64) -> usize {
+    fn pow(&mut self, i: usize, n: f32) -> usize {
         let grad = n * self.values[i].data.powf(n - 1.0);
         let inputs = [Some((i, grad)), None];
         self.push(Value::new(self.values[i].data.powf(n), inputs))
@@ -188,7 +188,7 @@ impl Matrix {
     fn new(tape: &mut Tape, rows: usize, cols: usize) -> Self {
         // Kaiming initialization
         let mut rng = rand::thread_rng();
-        let k = (6.0 / cols as f64).sqrt();
+        let k = (6.0 / cols as f32).sqrt();
         let dist = Uniform::new(-k, k);
 
         let n = rows * cols;
@@ -308,7 +308,7 @@ impl Gpt {
 
                 // The dot product between the query and all keys determines how
                 // relevant each token is to the query. Scale to make variance roughly 1.
-                let scale = tape.value(1.0 / (HEAD_DIM as f64).powf(0.5));
+                let scale = tape.value(1.0 / (HEAD_DIM as f32).powf(0.5));
                 let attn_logits = Vec::from_iter((0..n_ctx).map(|t| {
                     let mut dot = tape.value(0.0);
                     for i in 0..HEAD_DIM {
@@ -367,8 +367,8 @@ impl Gpt {
     fn train(&mut self, tape: &mut Tape, docs: &[String], uchars: &[char], bos: usize) {
         let step_width = TRAINING_STEPS.to_string().len();
 
-        let mut m: Vec<f64> = vec![0.0; self.size];
-        let mut v: Vec<f64> = vec![0.0; self.size];
+        let mut m: Vec<f32> = vec![0.0; self.size];
+        let mut v: Vec<f32> = vec![0.0; self.size];
 
         println!("Training steps: {TRAINING_STEPS}");
         for step in 0..TRAINING_STEPS {
@@ -395,7 +395,7 @@ impl Gpt {
                 sum = tape.add(sum, l);
             }
 
-            let inv_n = tape.value(1.0 / n as f64);
+            let inv_n = tape.value(1.0 / n as f32);
             let loss = tape.mul(sum, inv_n);
 
             println!(
@@ -408,9 +408,9 @@ impl Gpt {
 
             tape.backward();
 
-            let stepf = step as f64;
+            let stepf = step as f32;
             // Linear learning rate decay
-            let lr_t = LEARNING_RATE * (1.0 - (stepf / TRAINING_STEPS as f64));
+            let lr_t = LEARNING_RATE * (1.0 - (stepf / TRAINING_STEPS as f32));
             for i in 0..self.size {
                 let p = &mut tape.values[i];
                 m[i] = BETA_1 * m[i] + (1.0 - BETA_1) * p.grad;
