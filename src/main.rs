@@ -1,4 +1,4 @@
-use rand::distributions::Distribution;
+use rand::distributions::{Distribution, WeightedIndex};
 use rand::thread_rng;
 use rand::{distributions::Uniform, seq::SliceRandom};
 use std::{
@@ -7,11 +7,17 @@ use std::{
     vec,
 };
 
-const N_EMBED: usize = 16; // embedding dimension
+const N_EMBED: usize = 32; // embedding dimension
 const N_HEAD: usize = 4; // Number of attention heads
-const N_LAYER: usize = 1; // number of layers
+const N_LAYER: usize = 2; // number of layers
 const BLOCK_SIZE: usize = 16; // Context window
 const HEAD_DIM: usize = N_EMBED / N_HEAD;
+const TRAINING_STEPS: usize = 1_000;
+const N_SAMPLES: usize = 24;
+const LEARNING_RATE: f64 = 0.01;
+const BETA_1: f64 = 0.85;
+const BETA_2: f64 = 0.99;
+const EPS_ADAM: f64 = 1e-8;
 
 fn main() -> std::io::Result<()> {
     let file = fs::File::open("input.txt")?;
@@ -23,6 +29,7 @@ fn main() -> std::io::Result<()> {
     }
     let mut rng = thread_rng();
     docs.shuffle(&mut rng);
+    println!("Docs: {}", docs.len());
 
     // Each unique character becomes a token assigned a unique integer
     let mut uchars: Vec<char> = docs.join("").chars().collect();
@@ -32,11 +39,14 @@ fn main() -> std::io::Result<()> {
     // ID for the special beginning of sequence character
     let bos = uchars.len();
     let vocab_size = bos + 1;
+    println!("Vocab size: {vocab_size}");
 
     let mut tape = Tape::new();
-    let gpt = Gpt::new(&mut tape, vocab_size);
+    let mut gpt = Gpt::new(&mut tape, vocab_size);
+    println!("Params: {}", gpt.size);
 
-    println!("Tape len: {}", tape.values.len());
+    gpt.train(&mut tape, &docs, &uchars, bos);
+    gpt.infer(&mut tape, &uchars, bos);
 
     Ok(())
 }
@@ -88,31 +98,33 @@ impl Tape {
     }
 
     fn rmsnorm(&mut self, x: &[usize]) -> Vec<usize> {
-        let mut ms = 0.0;
+        let mut sum = self.value(1e-5);
         for &v in x {
             let i = self.mul(v, v);
-            ms += self.values[i].data;
+            sum = self.add(sum, i);
         }
 
-        let scale = self.value((ms + 1e-5).powf(-0.5));
+        let inv_n = self.value(1.0 / x.len() as f64);
+        let mean = self.mul(sum, inv_n);
+        let scale = self.pow(mean, -0.5);
         Vec::from_iter(x.iter().map(|&v| self.mul(v, scale)))
     }
 
     fn softmax(&mut self, x: &[usize]) -> Vec<usize> {
         let data = x.iter().map(|&i| self.values[i].data);
-        let max = data.fold(0.0f64, f64::max);
+        let max = data.reduce(f64::max).unwrap();
         let neg_max = self.value(-max);
 
         let mut exps = vec![];
-        let mut total = 0.0;
-        for i in x {
-            let scaled = self.add(*i, neg_max);
+        let mut total = self.value(0.0);
+        for &i in x {
+            let scaled = self.add(i, neg_max);
             let exp = self.exp(scaled);
-            total += self.values[exp].data;
             exps.push(exp);
+            total = self.add(total, exp);
         }
 
-        let div = self.value(1.0 / total);
+        let div = self.pow(total, -1.0);
         Vec::from_iter(exps.iter().map(|&e| self.mul(e, div)))
     }
 
@@ -174,8 +186,10 @@ struct Matrix {
 
 impl Matrix {
     fn new(tape: &mut Tape, rows: usize, cols: usize) -> Self {
+        // Kaiming initialization
         let mut rng = rand::thread_rng();
-        let dist = Uniform::new(-1.0, 1.0);
+        let k = (6.0 / cols as f64).sqrt();
+        let dist = Uniform::new(-k, k);
 
         let n = rows * cols;
         let mut values = Vec::with_capacity(n);
@@ -189,7 +203,8 @@ impl Matrix {
     }
 
     fn row(&self, r: usize) -> &[usize] {
-        &self.values[r..self.cols]
+        let s = r * self.cols;
+        &self.values[s..s + self.cols]
     }
 
     fn linear(&self, tape: &mut Tape, v: &[usize]) -> Vec<usize> {
@@ -212,6 +227,11 @@ impl Matrix {
     }
 }
 
+struct Cache {
+    keys: Vec<Vec<usize>>,
+    values: Vec<Vec<usize>>,
+}
+
 struct Layer {
     attn_wq: Matrix,
     attn_wk: Matrix,
@@ -219,6 +239,7 @@ struct Layer {
     attn_wo: Matrix,
     mlp_fc1: Matrix,
     mlp_fc2: Matrix,
+    cache: Cache,
 }
 
 impl Layer {
@@ -230,6 +251,10 @@ impl Layer {
             attn_wo: Matrix::new(tape, n_embed, n_embed),
             mlp_fc1: Matrix::new(tape, 4 * n_embed, n_embed),
             mlp_fc2: Matrix::new(tape, n_embed, n_embed * 4),
+            cache: Cache {
+                keys: vec![],
+                values: vec![],
+            },
         }
     }
 }
@@ -240,8 +265,6 @@ struct Gpt {
     lm_head: Matrix,
     layers: Vec<Layer>,
     size: usize,
-    keys: Vec<Vec<usize>>,
-    values: Vec<Vec<usize>>,
 }
 
 impl Gpt {
@@ -252,8 +275,6 @@ impl Gpt {
             lm_head: Matrix::new(tape, vocab_size, N_EMBED),
             layers: Vec::from_iter((0..N_LAYER).map(|_| Layer::new(tape, N_EMBED))),
             size: tape.values.len(),
-            keys: vec![],
-            values: vec![],
         }
     }
 
@@ -261,7 +282,9 @@ impl Gpt {
         // Combined token and position embedding.
         let wte = self.wte.row(token_id);
         let wpe = self.wpe.row(pos_id);
-        let mut x: Vec<usize> = Vec::from_iter((0..N_EMBED).map(|i| tape.add(wte[i], wpe[i])));
+
+        let mut x = Vec::from_iter((0..N_EMBED).map(|i| tape.add(wte[i], wpe[i])));
+        x = tape.rmsnorm(&x);
 
         for layer in &mut self.layers {
             let x_residual = x.clone();
@@ -273,9 +296,9 @@ impl Gpt {
             let v = layer.attn_wv.linear(tape, &x);
 
             // Cache the key and value embeddings.
-            self.keys.push(k.clone());
-            self.values.push(v.clone());
-            let n_ctx = self.keys.len();
+            layer.cache.keys.push(k.clone());
+            layer.cache.values.push(v.clone());
+            let n_ctx = layer.cache.keys.len();
 
             let mut x_attn = vec![];
             for h in 0..N_HEAD {
@@ -290,7 +313,7 @@ impl Gpt {
                     let mut dot = tape.value(0.0);
                     for i in 0..HEAD_DIM {
                         let q = q_head[i];
-                        let k = self.keys[t][h_start + i];
+                        let k = layer.cache.keys[t][h_start + i];
                         let p = tape.mul(k, q);
                         dot = tape.add(dot, p)
                     }
@@ -304,7 +327,7 @@ impl Gpt {
                 let mut head_out = Vec::from_iter((0..HEAD_DIM).map(|i| {
                     let mut sum = tape.value(0.0);
                     for t in 0..n_ctx {
-                        let v = self.values[t][h_start + i];
+                        let v = layer.cache.values[t][h_start + i];
                         let p = tape.mul(attn_weights[t], v);
                         sum = tape.add(sum, p)
                     }
@@ -339,5 +362,102 @@ impl Gpt {
 
         // Output logits
         self.lm_head.linear(tape, &x)
+    }
+
+    fn train(&mut self, tape: &mut Tape, docs: &[String], uchars: &[char], bos: usize) {
+        let step_width = TRAINING_STEPS.to_string().len();
+
+        let mut m: Vec<f64> = vec![0.0; self.size];
+        let mut v: Vec<f64> = vec![0.0; self.size];
+
+        println!("Training steps: {TRAINING_STEPS}");
+        for step in 0..TRAINING_STEPS {
+            let doc = &docs[step % docs.len()];
+
+            let mut token: [usize; BLOCK_SIZE] = [bos; BLOCK_SIZE];
+            for (i, c) in doc.chars().take(BLOCK_SIZE - 1).enumerate() {
+                token[i + 1] = uchars.iter().position(|&u| u == c).unwrap();
+            }
+
+            let n = (doc.len() + 1).min(BLOCK_SIZE - 1);
+            let losses = Vec::from_iter((0..n).map(|pos_id| {
+                let token_id = token[pos_id];
+                let target_id = token[pos_id + 1];
+                let logits = self.forward(tape, token_id, pos_id);
+                let probs = tape.softmax(&logits);
+                let loss_t = tape.log(probs[target_id]);
+
+                tape.neg(loss_t)
+            }));
+
+            let mut sum = tape.value(0.0);
+            for &l in &losses {
+                sum = tape.add(sum, l);
+            }
+
+            let inv_n = tape.value(1.0 / n as f64);
+            let loss = tape.mul(sum, inv_n);
+
+            println!(
+                "Loss {:0width$} / {}: {}",
+                step + 1,
+                TRAINING_STEPS,
+                tape.values[loss].data,
+                width = step_width
+            );
+
+            tape.backward();
+
+            let stepf = step as f64;
+            // Linear learning rate decay
+            let lr_t = LEARNING_RATE * (1.0 - (stepf / TRAINING_STEPS as f64));
+            for i in 0..self.size {
+                let p = &mut tape.values[i];
+                m[i] = BETA_1 * m[i] + (1.0 - BETA_1) * p.grad;
+                v[i] = BETA_2 * v[i] + (1.0 - BETA_2) * p.grad.powf(2.0);
+                let m_hat = m[i] / (1.0 - BETA_1.powf(stepf + 1.0));
+                let v_hat = v[i] / (1.0 - BETA_2.powf(stepf + 1.0));
+                p.data -= lr_t * m_hat / (v_hat.powf(0.5) + EPS_ADAM);
+                p.grad = 0.0;
+            }
+
+            tape.values.truncate(self.size);
+            for layer in &mut self.layers {
+                layer.cache.keys.clear();
+                layer.cache.values.clear();
+            }
+        }
+    }
+
+    fn infer(&mut self, tape: &mut Tape, uchars: &[char], bos: usize) {
+        for _ in 0..N_SAMPLES {
+            let mut rng = thread_rng();
+            let mut token_id = bos;
+            let mut sample = vec![];
+
+            for pos_id in 0..BLOCK_SIZE {
+                let logits = self.forward(tape, token_id, pos_id);
+                let probs = tape.softmax(&logits);
+                let weights = Vec::from_iter(probs.iter().map(|&v| tape.values[v].data));
+                let dist = WeightedIndex::new(&weights).unwrap();
+                token_id = dist.sample(&mut rng);
+
+                if token_id == bos {
+                    break;
+                }
+
+                let c = uchars[token_id];
+                sample.push(c);
+            }
+
+            tape.values.truncate(self.size);
+            for layer in &mut self.layers {
+                layer.cache.keys.clear();
+                layer.cache.values.clear();
+            }
+
+            let s: String = sample.iter().collect();
+            println!("Sample: {}", s);
+        }
     }
 }
