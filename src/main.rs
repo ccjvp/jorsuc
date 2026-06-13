@@ -1,56 +1,328 @@
 use rand::distributions::{Distribution, WeightedIndex};
 use rand::thread_rng;
 use rand::{distributions::Uniform, seq::SliceRandom};
-use std::{
-    fs,
-    io::{self, BufRead},
-    vec,
-};
+use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::hash::Hash;
+use std::io::BufRead;
+use std::ops::Add;
+use std::{fs, vec};
 
 const N_EMBED: usize = 16; // embedding dimension
 const N_HEAD: usize = 4; // Number of attention heads
-const N_LAYER: usize = 1; // number of layers
+const N_LAYER: usize = 4; // number of layers
 const BLOCK_SIZE: usize = 16; // Context window
 const HEAD_DIM: usize = N_EMBED / N_HEAD;
-const TRAINING_STEPS: usize = 1000;
-const N_SAMPLES: usize = 1;
+const TRAINING_STEPS: usize = 100_00;
+const N_SAMPLES: usize = 16;
 const LEARNING_RATE: f32 = 0.01;
 const BETA_1: f32 = 0.85;
 const BETA_2: f32 = 0.99;
 const EPS_ADAM: f32 = 1e-8;
+const N_RULES: usize = 64;
+const N_CHARS: usize = 6;
 
-fn main() -> std::io::Result<()> {
-    let file = fs::File::open("input.txt")?;
-    let reader = io::BufReader::new(file);
+// TODO: Don't read all inputs into memory
+// TODO: Bytes instead of chars
+// TODO: GPU
 
-    let mut docs = vec![];
-    for doc in reader.lines() {
-        docs.push(doc.unwrap());
-    }
+fn main() {
     let mut rng = thread_rng();
-    docs.shuffle(&mut rng);
-    println!("Docs: {}", docs.len());
+    let file = fs::File::open("input.txt").expect("Input file not found");
+    let reader = std::io::BufReader::new(file);
 
-    // Each unique character becomes a token assigned a unique integer
-    let mut uchars: Vec<char> = docs.join("").chars().collect();
-    uchars.sort();
-    uchars.dedup();
+    let mut inputs = Vec::from_iter(reader.lines().flatten());
+    inputs.shuffle(&mut rng);
 
-    // ID for the special beginning of sequence character
-    let bos = uchars.len();
-    let vocab_size = bos + 1;
-    println!("Vocab size: {vocab_size}");
+    let mut tokenizer = Tokenizer::new();
+    tokenizer.train(&inputs);
+    println!("Vocab: {}", tokenizer.vocab.len() + 1);
 
     let mut tape = Tape::new();
-    let mut gpt = Gpt::new(&mut tape, vocab_size);
+    let mut gpt = Gpt::new(&mut tape, &tokenizer);
     println!("Params: {}", gpt.size);
 
-    gpt.train(&mut tape, &docs, &uchars, bos);
-    gpt.infer(&mut tape, &uchars, bos);
-
-    Ok(())
+    gpt.train(&mut tape, &mut tokenizer, &inputs);
+    gpt.infer(&mut tape, &tokenizer);
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+struct Token {
+    chars: [char; N_CHARS],
+}
+
+impl Token {
+    fn from_char(c: char) -> Self {
+        let mut chars: [char; N_CHARS] = ['\0'; N_CHARS];
+        chars[0] = c;
+
+        Self { chars }
+    }
+}
+
+impl Add for Token {
+    type Output = Token;
+
+    fn add(self, other: Self) -> Token {
+        let mut chars = self.chars;
+
+        let mut j = 0;
+        for i in 0..N_CHARS {
+            if self.chars[i] != '\0' {
+                continue;
+            }
+
+            if other.chars[j] == '\0' {
+                break;
+            }
+
+            chars[i] = other.chars[j];
+            j += 1;
+        }
+
+        assert!(other.chars.get(j).is_none_or(|&c| c == '\0'));
+
+        Token { chars }
+    }
+}
+
+struct Tokenizer {
+    rules: HashMap<(Token, Token), usize>,
+    encoder: HashMap<Token, usize>,
+    vocab: Vec<Token>,
+    sequence: Vec<Token>,
+    prev: Vec<Option<usize>>,
+    next: Vec<Option<usize>>,
+    dead: Vec<bool>,
+    pairs: HashMap<(Token, Token), HashSet<usize>>,
+    heap: BinaryHeap<(usize, (Token, Token))>,
+    bos: usize,
+}
+
+impl Tokenizer {
+    fn add_input(&mut self, input: &str) {
+        let chars: Vec<_> = input.chars().collect();
+        for (i, pair) in chars.windows(2).enumerate() {
+            let left = Token::from_char(pair[0]);
+            let right = Token::from_char(pair[1]);
+            let pos = self.sequence.len();
+
+            self.sequence.push(left);
+            self.pairs.entry((left, right)).or_default().insert(pos);
+            self.prev.push(if i == 0 { None } else { Some(pos - 1) });
+            self.next.push(Some(pos + 1));
+        }
+
+        if let Some(&c) = chars.last() {
+            let token = Token::from_char(c);
+            self.prev.push(Some(self.sequence.len() - 1));
+            self.sequence.push(token);
+            self.next.push(None);
+        }
+
+        self.dead.resize(self.sequence.len(), false);
+    }
+
+    // Move position from one key (pair) to another
+    fn rekey_position(
+        &mut self,
+        from_key: (Token, Token),
+        to_key: (Token, Token),
+        old_pos: usize,
+        new_pos: usize,
+    ) {
+        if let Some(positions) = self.pairs.get_mut(&from_key) {
+            positions.remove(&old_pos);
+        }
+
+        self.pairs.entry(to_key).or_default().insert(new_pos);
+
+        if self.bos == 0 {
+            let freq = self.pairs[&to_key].len();
+            self.heap.push((freq, to_key));
+        }
+    }
+
+    fn merge_pair(&mut self, pair: (Token, Token)) {
+        let mut rule_added = self.bos != 0;
+        if let Some(positions) = self.pairs.remove(&pair) {
+            for start in positions {
+                if self.dead[start] {
+                    continue;
+                }
+
+                if let Some(end) = self.next[start] {
+                    // Tokens might have been mutated invalidating the pair
+                    if (self.sequence[start], self.sequence[end]) != pair {
+                        continue;
+                    }
+
+                    let merged = self.sequence[start] + self.sequence[end];
+                    if rule_added == false {
+                        let rank = self.rules.len();
+                        self.rules.insert(pair, rank);
+                        rule_added = true
+                    };
+
+                    if let Some(left) = self.prev[start] {
+                        let from_key = (self.sequence[left], self.sequence[start]);
+                        let to_key = (self.sequence[left], merged);
+                        self.rekey_position(from_key, to_key, left, left);
+                    }
+
+                    // Unlink end from the chain start -> end -> right
+                    let right = self.next[end];
+                    self.next[start] = right;
+                    self.dead[end] = true;
+                    if let Some(right) = right {
+                        self.prev[right] = Some(start);
+
+                        let from_key = (self.sequence[end], self.sequence[right]);
+                        let to_key = (merged, self.sequence[right]);
+                        self.rekey_position(from_key, to_key, end, start);
+                    }
+
+                    self.sequence[start] = merged;
+                }
+            }
+        }
+    }
+
+    fn learn_rules(&mut self) {
+        while let Some(rule) = &self.heap.pop() {
+            let freq = rule.0;
+            let pair = rule.1;
+
+            if let Some(positions) = self.pairs.get(&pair) {
+                let current_freq = positions.len();
+                if freq != current_freq {
+                    self.heap.push((current_freq, rule.1));
+                    continue;
+                }
+
+                self.merge_pair(pair);
+            }
+
+            if self.rules.len() == N_RULES {
+                break;
+            }
+        }
+    }
+
+    fn reset_scratch(&mut self) {
+        self.sequence.clear();
+        self.prev.clear();
+        self.next.clear();
+        self.pairs.clear();
+        self.heap.clear();
+    }
+
+    fn encode(&mut self, input: &str) -> [usize; BLOCK_SIZE] {
+        self.reset_scratch();
+        self.add_input(input);
+        self.dead.fill(false);
+
+        for key in self.pairs.keys() {
+            if let Some(&rank) = self.rules.get(key) {
+                self.heap.push((self.rules.len() - rank, *key));
+            }
+        }
+
+        while let Some(rule) = self.heap.pop() {
+            let token = rule.1;
+            self.merge_pair(token);
+        }
+
+        let mut doc = [self.bos; BLOCK_SIZE];
+        let mut pos = 0;
+        for (i, &t) in self.sequence.iter().enumerate() {
+            if self.dead[i] {
+                continue;
+            }
+
+            if pos >= BLOCK_SIZE {
+                break;
+            }
+
+            if let Some(&j) = self.encoder.get(&t) {
+                doc[pos] = j;
+                pos += 1;
+            };
+        }
+        
+        doc
+    }
+
+    fn get_vocab(&self) -> Vec<Token> {
+        let mut vocab: Vec<_> = self
+            .sequence
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !self.dead[*i])
+            .map(|(_, c)| *c)
+            .collect();
+
+        vocab.sort();
+        vocab.dedup();
+
+        vocab
+    }
+
+    fn get_encoder(&self) -> HashMap<Token, usize> {
+        self.vocab
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(i, t)| (t, i))
+            .collect()
+    }
+
+    fn train(&mut self, inputs: &Vec<String>) {
+        for input in inputs {
+            self.add_input(input);
+        }
+
+        self.dead.resize(self.sequence.len(), false);
+        self.dead.fill(false);
+
+        for p in &self.pairs {
+            let freq = p.1.len();
+            self.heap.push((freq, *p.0));
+        }
+
+        self.learn_rules();
+
+        self.vocab = self.get_vocab();
+        self.encoder = self.get_encoder();
+        self.bos = self.vocab.len();
+    }
+
+    fn new() -> Self {
+        let sequence = vec![];
+        let prev = vec![];
+        let next = vec![];
+        let dead = vec![];
+        let vocab = vec![];
+        let encoder = HashMap::new();
+        let pairs = HashMap::new();
+        let rules = HashMap::with_capacity(N_RULES);
+        let heap = BinaryHeap::new();
+
+        Self {
+            sequence,
+            prev,
+            next,
+            dead,
+            vocab,
+            encoder,
+            pairs,
+            rules,
+            heap,
+            bos: 0,
+        }
+    }
+}
+
+// TODO: Tensor
 #[derive(Clone, Copy)]
 struct Value {
     // Output of the forward pass
@@ -268,7 +540,8 @@ struct Gpt {
 }
 
 impl Gpt {
-    fn new(tape: &mut Tape, vocab_size: usize) -> Self {
+    fn new(tape: &mut Tape, tokenizer: &Tokenizer) -> Self {
+        let vocab_size = tokenizer.vocab.len() + 1;
         Self {
             wte: Matrix::new(tape, vocab_size, N_EMBED),
             wpe: Matrix::new(tape, BLOCK_SIZE, N_EMBED),
@@ -364,35 +637,34 @@ impl Gpt {
         self.lm_head.linear(tape, &x)
     }
 
-    fn train(&mut self, tape: &mut Tape, docs: &[String], uchars: &[char], bos: usize) {
+    fn train(&mut self, tape: &mut Tape, tokenizer: &mut Tokenizer, inputs: &Vec<String>) {
         let step_width = TRAINING_STEPS.to_string().len();
 
         let mut m: Vec<f32> = vec![0.0; self.size];
         let mut v: Vec<f32> = vec![0.0; self.size];
-
-        println!("Training steps: {TRAINING_STEPS}");
         for step in 0..TRAINING_STEPS {
-            let doc = &docs[step % docs.len()];
-
-            let mut token: [usize; BLOCK_SIZE] = [bos; BLOCK_SIZE];
-            for (i, c) in doc.chars().take(BLOCK_SIZE - 1).enumerate() {
-                token[i + 1] = uchars.iter().position(|&u| u == c).unwrap();
-            }
-
-            let n = (doc.len() + 1).min(BLOCK_SIZE - 1);
-            let losses = Vec::from_iter((0..n).map(|pos_id| {
-                let token_id = token[pos_id];
-                let target_id = token[pos_id + 1];
-                let logits = self.forward(tape, token_id, pos_id);
-                let probs = tape.softmax(&logits);
-                let loss_t = tape.log(probs[target_id]);
-
-                tape.neg(loss_t)
-            }));
+            let input = &inputs[step % inputs.len()];
+            let encoded = tokenizer.encode(input);
 
             let mut sum = tape.value(0.0);
-            for &l in &losses {
-                sum = tape.add(sum, l);
+            let mut n = 0;
+            for (pos_id, pair) in encoded.windows(2).enumerate() {
+                let token_id = pair[0];
+                let target_id = pair[1];
+                let logits = self.forward(tape, token_id, pos_id);
+                let probs = tape.softmax(&logits);
+                // TODO: Get rid of epsilon hack
+                let eps = tape.value(1e-9);
+                let prob = tape.add(probs[target_id], eps);
+                let loss_t = tape.log(prob);
+                let loss = tape.neg(loss_t);
+
+                sum = tape.add(sum, loss);
+                n += 1;
+
+                if target_id == tokenizer.bos {
+                    break;
+                }
             }
 
             let inv_n = tape.value(1.0 / n as f32);
@@ -429,10 +701,10 @@ impl Gpt {
         }
     }
 
-    fn infer(&mut self, tape: &mut Tape, uchars: &[char], bos: usize) {
+    fn infer(&mut self, tape: &mut Tape, tokenizer: &Tokenizer) {
         for _ in 0..N_SAMPLES {
             let mut rng = thread_rng();
-            let mut token_id = bos;
+            let mut token_id = tokenizer.bos;
             let mut sample = vec![];
 
             for pos_id in 0..BLOCK_SIZE {
@@ -442,12 +714,12 @@ impl Gpt {
                 let dist = WeightedIndex::new(&weights).unwrap();
                 token_id = dist.sample(&mut rng);
 
-                if token_id == bos {
+                if token_id == tokenizer.bos {
                     break;
                 }
 
-                let c = uchars[token_id];
-                sample.push(c);
+                let t = tokenizer.vocab[token_id];
+                sample.extend(t.chars);
             }
 
             tape.values.truncate(self.size);
