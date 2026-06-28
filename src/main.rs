@@ -1,9 +1,9 @@
 use rand::distributions::{Distribution, WeightedIndex};
 use rand::thread_rng;
-use rand::{distributions::Uniform, seq::SliceRandom};
+use rand::{distributions::Uniform};
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::hash::Hash;
-use std::io::BufRead;
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::ops::Add;
 use std::{fs, vec};
 
@@ -21,41 +21,32 @@ const EPS_ADAM: f32 = 1e-8;
 const N_RULES: usize = 64;
 const N_CHARS: usize = 6;
 
-// TODO: Don't read all inputs into memory
-// TODO: Bytes instead of chars
 // TODO: GPU
 
 fn main() {
-    let mut rng = thread_rng();
-    let file = fs::File::open("input.txt").expect("Input file not found");
-    let reader = std::io::BufReader::new(file);
-
-    let mut inputs = Vec::from_iter(reader.lines().flatten());
-    inputs.shuffle(&mut rng);
-
     let mut tokenizer = Tokenizer::new();
-    tokenizer.train(&inputs);
+    tokenizer.train("input.txt");
     println!("Vocab: {}", tokenizer.vocab.len() + 1);
 
     let mut tape = Tape::new();
     let mut gpt = Gpt::new(&mut tape, &tokenizer);
     println!("Params: {}", gpt.size);
 
-    gpt.train(&mut tape, &mut tokenizer, &inputs);
+    gpt.train(&mut tape, &mut tokenizer, "input.txt");
     gpt.infer(&mut tape, &tokenizer);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 struct Token {
-    chars: [char; N_CHARS],
+    bytes: [Option<u8>; N_CHARS],
 }
 
 impl Token {
-    fn from_char(c: char) -> Self {
-        let mut chars: [char; N_CHARS] = ['\0'; N_CHARS];
-        chars[0] = c;
+    fn new(b: u8) -> Self {
+        let mut bytes: [Option<u8>; N_CHARS] = [None; N_CHARS];
+        bytes[0] = Some(b);
 
-        Self { chars }
+        Self { bytes }
     }
 }
 
@@ -63,25 +54,23 @@ impl Add for Token {
     type Output = Token;
 
     fn add(self, other: Self) -> Token {
-        let mut chars = self.chars;
+        let mut bytes = self.bytes;
 
         let mut j = 0;
         for i in 0..N_CHARS {
-            if self.chars[i] != '\0' {
+            if self.bytes[i].is_some() {
                 continue;
             }
 
-            if other.chars[j] == '\0' {
+            if other.bytes[j].is_none() {
                 break;
             }
 
-            chars[i] = other.chars[j];
+            bytes[i] = other.bytes[j];
             j += 1;
         }
 
-        assert!(other.chars.get(j).is_none_or(|&c| c == '\0'));
-
-        Token { chars }
+        Token { bytes }
     }
 }
 
@@ -100,10 +89,10 @@ struct Tokenizer {
 
 impl Tokenizer {
     fn add_input(&mut self, input: &str) {
-        let chars: Vec<_> = input.chars().collect();
-        for (i, pair) in chars.windows(2).enumerate() {
-            let left = Token::from_char(pair[0]);
-            let right = Token::from_char(pair[1]);
+        let bytes = input.as_bytes();
+        for (i, pair) in bytes.windows(2).enumerate() {
+            let left = Token::new(pair[0]);
+            let right = Token::new(pair[1]);
             let pos = self.sequence.len();
 
             self.sequence.push(left);
@@ -112,8 +101,8 @@ impl Tokenizer {
             self.next.push(Some(pos + 1));
         }
 
-        if let Some(&c) = chars.last() {
-            let token = Token::from_char(c);
+        if let Some(&b) = bytes.last() {
+            let token = Token::new(b);
             self.prev.push(Some(self.sequence.len() - 1));
             self.sequence.push(token);
             self.next.push(None);
@@ -248,7 +237,7 @@ impl Tokenizer {
                 pos += 1;
             };
         }
-        
+
         doc
     }
 
@@ -276,9 +265,13 @@ impl Tokenizer {
             .collect()
     }
 
-    fn train(&mut self, inputs: &Vec<String>) {
-        for input in inputs {
-            self.add_input(input);
+    fn train(&mut self, path: &str) {
+        let file = fs::File::open(path).expect("Input file not found");
+        let reader = std::io::BufReader::new(file);
+
+        for line in reader.lines() {
+            let input = line.expect("Failed to read line");
+            self.add_input(&input);
         }
 
         self.dead.resize(self.sequence.len(), false);
@@ -637,14 +630,37 @@ impl Gpt {
         self.lm_head.linear(tape, &x)
     }
 
-    fn train(&mut self, tape: &mut Tape, tokenizer: &mut Tokenizer, inputs: &Vec<String>) {
+    fn train(&mut self, tape: &mut Tape, tokenizer: &mut Tokenizer, path: &str) {
+        let mut file = fs::File::open(path).expect("Input file not found");
+        let reader = std::io::BufReader::new(&file);
+
+        let mut offsets = vec![];
+        let mut pos = 0u64;
+        for line in reader.lines() {
+            let line = line.expect("failed to read line");
+            offsets.push(pos);
+            pos += line.len() as u64 + 1;
+        }
+
+        let num_lines = offsets.len();
         let step_width = TRAINING_STEPS.to_string().len();
 
         let mut m: Vec<f32> = vec![0.0; self.size];
         let mut v: Vec<f32> = vec![0.0; self.size];
         for step in 0..TRAINING_STEPS {
-            let input = &inputs[step % inputs.len()];
-            let encoded = tokenizer.encode(input);
+            let offset = offsets[step % num_lines];
+            file.seek(SeekFrom::Start(offset)).unwrap_or_else(|e| {
+                panic!("Failed to seek to {offset}: {e}");
+            });
+
+            let reader = BufReader::new(&file);
+            let input = reader
+                .lines()
+                .next()
+                .expect("no line at offset")
+                .expect("failed to read line");
+
+            let encoded = tokenizer.encode(&input);
 
             let mut sum = tape.value(0.0);
             let mut n = 0;
@@ -719,7 +735,7 @@ impl Gpt {
                 }
 
                 let t = tokenizer.vocab[token_id];
-                sample.extend(t.chars);
+                sample.extend(t.bytes.iter().flatten().copied());
             }
 
             tape.values.truncate(self.size);
@@ -728,7 +744,7 @@ impl Gpt {
                 layer.cache.values.clear();
             }
 
-            let s: String = sample.iter().collect();
+            let s = String::from_utf8(sample).expect("invalid utf-8");
             println!("Sample: {}", s);
         }
     }
