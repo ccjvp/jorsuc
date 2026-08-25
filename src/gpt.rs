@@ -1,0 +1,344 @@
+use crate::tape::{Shape, Tape, Tensor};
+use crate::tokenizer::{N_CONTEXT, Tokenizer};
+use rand::distributions::{Distribution, WeightedIndex};
+use rand::thread_rng;
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::time::Instant;
+use std::{fs, vec};
+
+const D_MODEL: usize = 256;
+const N_HEAD: usize = 4;
+const N_LAYER: usize = 4;
+const HEAD_DIM: usize = D_MODEL / N_HEAD;
+const TRAINING_STEPS: usize = 10;
+const N_SAMPLES: usize = 16;
+const LEARNING_RATE: f32 = 0.01;
+const BETA_1: f32 = 0.85;
+const BETA_2: f32 = 0.99;
+const EPS_ADAM: f32 = 1e-8;
+
+struct Cache {
+    keys: Vec<usize>,
+    values: Vec<usize>,
+}
+
+struct Layer {
+    attn_wq: usize,
+    attn_wk: usize,
+    attn_wv: usize,
+    attn_wo: usize,
+    mlp_fc1: usize,
+    mlp_fc2: usize,
+    cache: Cache,
+}
+
+impl Layer {
+    fn new(tape: &mut Tape, n_embed: usize) -> Self {
+        // GPT-2 trick to stop the residual stream's standard deviation
+        // from growing with depth at initialization
+        let wo_fc2_scale = 1.0 / (2.0 * N_LAYER as f32).sqrt();
+        let attn_shape = Shape::new(&[n_embed, n_embed]);
+        let attn_wq = tape.random(attn_shape, 1.0);
+        let attn_wk = tape.random(attn_shape, 1.0);
+        let attn_wv = tape.random(attn_shape, 1.0);
+        let attn_wo = tape.random(attn_shape, wo_fc2_scale);
+
+        let mlp_fc1 = tape.random(Shape::new(&[n_embed, n_embed * 4]), 1.0);
+        let mlp_fc2 = tape.random(Shape::new(&[n_embed * 4, n_embed]), wo_fc2_scale);
+
+        let cache = Cache {
+            keys: vec![],
+            values: vec![],
+        };
+
+        Self {
+            attn_wq,
+            attn_wk,
+            attn_wv,
+            attn_wo,
+            mlp_fc1,
+            mlp_fc2,
+            cache,
+        }
+    }
+}
+
+pub struct Gpt {
+    wte: usize,
+    lm_head: usize,
+    layers: Vec<Layer>,
+    params: usize,
+    pub size: usize,
+}
+
+impl Gpt {
+    pub fn new(tape: &mut Tape, tokenizer: &Tokenizer) -> Self {
+        let vocab_size = tokenizer.vocab.len() + 1;
+        let wte = tape.random(Shape::new(&[vocab_size, D_MODEL]), 1.0);
+        let lm_head = tape.random(Shape::new(&[D_MODEL, vocab_size]), 1.0);
+        let layers = Vec::from_iter((0..N_LAYER).map(|_| Layer::new(tape, D_MODEL)));
+        let params = tape.values.len();
+
+        // Add moment buffers
+        let n = tape.values.len();
+        for _ in 0..2 {
+            for i in 0..n {
+                let data_offset = tape.data.len();
+                let shape = tape.values[i].shape;
+
+                for _ in 0..shape.product() {
+                    tape.data.push(0.0);
+                }
+
+                tape.push(Tensor::new(data_offset, shape, None, None));
+            }
+        }
+
+        let size = tape.data.len();
+
+        Self {
+            wte,
+            lm_head,
+            layers,
+            params,
+            size,
+        }
+    }
+
+    fn truncate(&mut self, tape: &mut Tape) {
+        tape.values.truncate(self.size);
+        tape.data.truncate(self.size);
+        tape.inputs.truncate(0);
+
+        for layer in &mut self.layers {
+            layer.cache.keys.clear();
+            layer.cache.values.clear();
+        }
+    }
+
+    fn cross_entropy(&mut self, tape: &mut Tape, logits: usize, target_ids: &[usize]) -> usize {
+        let logits_shape = tape.values[logits].shape;
+        let vocab_size = logits_shape.get_dim(-1);
+        let zero = tape.scalar(0.0);
+        let one_hot = tape.reshape(zero, logits_shape);
+        let eps = tape.scalar(1e-9);
+
+        for (i, token_id) in target_ids.iter().copied().enumerate() {
+            let d_i = tape.values[one_hot].offset(i * vocab_size + token_id);
+            tape.data[d_i] = 1.0;
+        }
+
+        // TODO: Get rid of epsilon hack and implement log_softmax
+        let mut x = tape.softmax(logits);
+        x = tape.add(x, eps);
+        x = tape.log(x);
+        x = tape.mul(x, one_hot);
+        x = tape.sum(x, None);
+        x = tape.neg(x);
+
+        let seq_len = target_ids.len() as f32;
+        let n = tape.scalar(seq_len);
+        tape.div(x, n)
+    }
+
+    fn embedding(&mut self, tape: &mut Tape, tokenizer: &Tokenizer, token_ids: &[usize]) -> usize {
+        let vocab_size = tokenizer.vocab.len();
+        let seq_len = token_ids.len();
+        let zero = tape.scalar(0.0);
+        let shape = Shape::new(&[seq_len, vocab_size]);
+        let one_hot = tape.reshape(zero, shape);
+
+        for (i, token_id) in token_ids.iter().copied().enumerate() {
+            let d_i = tape.values[one_hot].offset(i * vocab_size + token_id);
+            tape.data[d_i] = 1.0;
+        }
+
+        tape.matmul(one_hot, self.wte)
+    }
+
+    fn forward(&mut self, tape: &mut Tape, tokenizer: &Tokenizer, token_ids: &[usize]) -> usize {
+        // Score standard deviation grows roughly with sqrt(head_dim)
+        let head_dim = tape.scalar(HEAD_DIM as f32);
+        let score_scale = tape.pow(head_dim, 0.5);
+        let seq_len = token_ids.len();
+        let head_shape = Shape::new(&[1, N_HEAD, seq_len, HEAD_DIM]);
+        let embedding = self.embedding(tape, tokenizer, token_ids);
+        let causal_mask = tape.causal_mask(seq_len);
+
+        let mut x = tape.matmul(embedding, self.wte);
+        x = tape.rmsnorm(x);
+
+        for layer in &mut self.layers {
+            let x_residual = x.clone();
+            x = tape.rmsnorm(x);
+
+            let k = tape.matmul(x, layer.attn_wk);
+            let k = tape.reshape(k, head_shape);
+
+            let v = tape.matmul(x, layer.attn_wv);
+            let v = tape.reshape(v, head_shape);
+
+            let q = tape.matmul(x, layer.attn_wq);
+            let q = tape.reshape(q, head_shape);
+
+            let k_t = tape.transpose(k, -2, -1);
+            let mut scores = tape.matmul(q, k_t);
+            scores = tape.mul(scores, causal_mask);
+            scores = tape.div(scores, score_scale);
+            scores = tape.softmax(scores);
+            scores = tape.matmul(scores, v);
+
+            x = tape.matmul(scores, layer.attn_wo);
+            x = tape.add(x, x_residual);
+
+            // MLP block
+            let x_residual = x.clone();
+            x = tape.rmsnorm(x);
+
+            // Project up to 4x the D_MODEL and RELU to make a non-linear transform
+            x = tape.matmul(x, layer.mlp_fc1);
+            x = tape.relu(x);
+
+            // Project down and add residual
+            x = tape.matmul(x, layer.mlp_fc2);
+            x = tape.add(x, x_residual);
+        }
+
+        // Keep the spread small to play nice with softmax
+        x = tape.rmsnorm(x);
+        tape.matmul(x, self.lm_head)
+    }
+
+    pub fn train(&mut self, tape: &mut Tape, tokenizer: &mut Tokenizer, path: &str) {
+        let mut file = fs::File::open(path).expect("Input file not found");
+        let reader = std::io::BufReader::new(&file);
+
+        let mut offsets = vec![];
+        let mut pos = 0u64;
+        for line in reader.lines() {
+            let line = line.expect("failed to read line");
+            offsets.push(pos);
+            pos += line.len() as u64 + 1;
+        }
+
+        let num_lines = offsets.len();
+
+        for step in 0..TRAINING_STEPS {
+            let start = Instant::now();
+            let offset = offsets[step % num_lines];
+            file.seek(SeekFrom::Start(offset)).unwrap_or_else(|e| {
+                panic!("Failed to seek to {offset}: {e}");
+            });
+
+            let reader = BufReader::new(&file);
+            let input = reader
+                .lines()
+                .next()
+                .expect("no line at offset")
+                .expect("failed to read line");
+
+            let token_ids = tokenizer.encode(&input);
+            let input_ids = &token_ids[..token_ids.len() - 1];
+            let target_ids = &token_ids[1..];
+
+            let logits = self.forward(tape, tokenizer, &input_ids);
+            let loss = self.cross_entropy(tape, logits, &target_ids);
+            let loss_f = tape.data[tape.values[loss].offset];
+
+            tape.backward();
+
+            // Linear learning rate decay
+            let stepf = step as f32;
+            let stepsf = TRAINING_STEPS as f32;
+            let lr_t = tape.scalar(LEARNING_RATE * (1.0 - (stepf / stepsf)));
+            let eps_adam = tape.scalar(EPS_ADAM);
+            let one = tape.scalar(1.0);
+
+            let b1 = tape.scalar(BETA_1);
+            let b1_complement = tape.sub(one, b1);
+            let m_pow = tape.pow(b1, stepf + 1.0);
+            let m_numerator = tape.sub(one, m_pow);
+
+            let b2 = tape.scalar(BETA_2);
+            let b2_complement = tape.sub(one, b2);
+            let v_pow = tape.pow(b2, stepf + 1.0);
+            let v_numerator = tape.sub(one, v_pow);
+
+            for i in 0..self.params {
+                if let Some(grad) = tape.values[i].grad {
+                    let mi = self.params + i;
+                    let m1 = tape.mul(mi, b1);
+                    let m2 = tape.mul(grad, b1_complement);
+                    let m3 = tape.add(m1, m2);
+                    tape.copy_data(m3, mi);
+
+                    let grad_squared = tape.pow(grad, 2.0);
+                    let vi = self.params * 2 + i;
+                    let v1 = tape.mul(vi, b2);
+                    let v2 = tape.mul(grad_squared, b2_complement);
+                    let v3 = tape.add(v1, v2);
+                    tape.copy_data(v3, vi);
+
+                    let m_hat = tape.div(mi, m_numerator);
+                    let v_hat = tape.div(vi, v_numerator);
+
+                    let v_hat_sqrt = tape.pow(v_hat, 0.5);
+                    let denominator = tape.add(v_hat_sqrt, eps_adam);
+                    let numerator = tape.mul(m_hat, lr_t);
+                    let change = tape.div(numerator, denominator);
+                    let neg_change = tape.neg(change);
+                    let d = tape.add(i, neg_change);
+
+                    tape.copy_data(d, i);
+                    tape.values[i].grad = None;
+                }
+            }
+
+            let w = TRAINING_STEPS.to_string().len();
+            let elapsed = start.elapsed();
+
+            println!(
+                "[{:02}.{:03}] Loss {:0>w$} / {}: {}",
+                elapsed.as_secs(),
+                elapsed.subsec_millis(),
+                step,
+                TRAINING_STEPS,
+                loss_f,
+                w = w
+            );
+
+            self.truncate(tape);
+        }
+    }
+
+    pub fn infer(&mut self, _tape: &mut Tape, _tokenizer: &mut Tokenizer) {
+        /*
+        for _ in 0..N_SAMPLES {
+            let mut rng = thread_rng();
+            let mut token_id = tokenizer.bos;
+            let mut sample = vec![];
+
+            for pos_id in 0..N_CONTEXT {
+                let logits = self.forward(tape, token_id, pos_id);
+                let probs = tape.softmax(logits);
+                let offset = tape.values[probs].offset;
+                let shape = tape.values[probs].shape;
+                let weights = &tape.data[offset..offset + shape.product()];
+                let dist = WeightedIndex::new(weights).unwrap();
+                token_id = dist.sample(&mut rng);
+
+                if token_id == tokenizer.bos {
+                    break;
+                }
+
+                let t = tokenizer.vocab[token_id];
+                sample.extend(t.bytes.iter().flatten().copied());
+            }
+
+            self.truncate(tape);
+
+            let s = String::from_utf8(sample).expect("invalid utf-8");
+            println!("Sample: {}", s);
+        }*/
+    }
+}
