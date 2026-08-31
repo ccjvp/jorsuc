@@ -4,8 +4,9 @@ use std::hash::Hash;
 use std::io::BufRead;
 use std::ops::Add;
 
-pub const N_CONTEXT: usize = 512;
-const N_RULES: usize = 256;
+pub const N_CONTEXT: usize = 64;
+// TODO: N_TOKENS instead of N_RULES
+const N_RULES: usize = 4096;
 const N_CHARS: usize = 6;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -182,7 +183,7 @@ impl Tokenizer {
         self.heap.clear();
     }
 
-    pub fn encode(&mut self, input: &str) -> [usize; N_CONTEXT] {
+    pub fn encode(&mut self, input: &str, out: &mut Vec<usize>) {
         self.reset_scratch();
         self.add_input(input);
         self.dead.fill(false);
@@ -198,24 +199,20 @@ impl Tokenizer {
             self.merge_pair(token, false);
         }
 
-        let mut doc = [self.bos; N_CONTEXT];
-        let mut pos = 0;
+        out.clear();
+        out.push(self.bos);
+
         for (i, &t) in self.sequence.iter().enumerate() {
             if self.dead[i] {
                 continue;
             }
 
-            if pos >= N_CONTEXT {
-                break;
-            }
-
             if let Some(&j) = self.encoder.get(&t) {
-                doc[pos] = j;
-                pos += 1;
+                out.push(j)
             };
         }
 
-        doc
+        out.push(self.bos)
     }
 
     fn get_vocab(&self) -> Vec<Token> {

@@ -6,21 +6,16 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::time::Instant;
 use std::{fs, vec};
 
-const D_MODEL: usize = 256;
-const N_HEAD: usize = 4;
-const N_LAYER: usize = 4;
+const D_MODEL: usize = 64;
+const N_HEAD: usize = 6;
+const N_LAYER: usize = 6;
 const HEAD_DIM: usize = D_MODEL / N_HEAD;
-const TRAINING_STEPS: usize = 10;
+const TRAINING_STEPS: usize = 100;
 const N_SAMPLES: usize = 16;
 const LEARNING_RATE: f32 = 0.01;
 const BETA_1: f32 = 0.85;
 const BETA_2: f32 = 0.99;
 const EPS_ADAM: f32 = 1e-8;
-
-struct Cache {
-    keys: Vec<usize>,
-    values: Vec<usize>,
-}
 
 struct Layer {
     attn_wq: usize,
@@ -29,7 +24,6 @@ struct Layer {
     attn_wo: usize,
     mlp_fc1: usize,
     mlp_fc2: usize,
-    cache: Cache,
 }
 
 impl Layer {
@@ -46,11 +40,6 @@ impl Layer {
         let mlp_fc1 = tape.random(Shape::new(&[n_embed, n_embed * 4]), 1.0);
         let mlp_fc2 = tape.random(Shape::new(&[n_embed * 4, n_embed]), wo_fc2_scale);
 
-        let cache = Cache {
-            keys: vec![],
-            values: vec![],
-        };
-
         Self {
             attn_wq,
             attn_wk,
@@ -58,7 +47,6 @@ impl Layer {
             attn_wo,
             mlp_fc1,
             mlp_fc2,
-            cache,
         }
     }
 }
@@ -67,8 +55,8 @@ pub struct Gpt {
     wte: usize,
     lm_head: usize,
     layers: Vec<Layer>,
-    params: usize,
-    pub size: usize,
+    pub n_weights: usize,
+    pub n_params: usize,
 }
 
 impl Gpt {
@@ -77,7 +65,8 @@ impl Gpt {
         let wte = tape.random(Shape::new(&[vocab_size, D_MODEL]), 1.0);
         let lm_head = tape.random(Shape::new(&[D_MODEL, vocab_size]), 1.0);
         let layers = Vec::from_iter((0..N_LAYER).map(|_| Layer::new(tape, D_MODEL)));
-        let params = tape.values.len();
+        let n_params = tape.data.len();
+        let n_weights = tape.values.len();
 
         // Add moment buffers
         let n = tape.values.len();
@@ -90,32 +79,27 @@ impl Gpt {
                     tape.data.push(0.0);
                 }
 
-                tape.push(Tensor::new(data_offset, shape, None, None));
+                tape.push(Tensor::new(data_offset, shape, None, None, true));
             }
         }
-
-        let size = tape.data.len();
 
         Self {
             wte,
             lm_head,
             layers,
-            params,
-            size,
+            n_params,
+            n_weights,
         }
     }
 
+    // Times 3 to account for moment buffers
     fn truncate(&mut self, tape: &mut Tape) {
-        tape.values.truncate(self.size);
-        tape.data.truncate(self.size);
+        tape.values.truncate(self.n_weights * 3);
+        tape.data.truncate(self.n_params * 3);
         tape.inputs.truncate(0);
-
-        for layer in &mut self.layers {
-            layer.cache.keys.clear();
-            layer.cache.values.clear();
-        }
     }
 
+    // TODO: Get rid of the one hot materialization
     fn cross_entropy(&mut self, tape: &mut Tape, logits: usize, target_ids: &[usize]) -> usize {
         let logits_shape = tape.values[logits].shape;
         let vocab_size = logits_shape.get_dim(-1);
@@ -142,7 +126,7 @@ impl Gpt {
     }
 
     fn embedding(&mut self, tape: &mut Tape, tokenizer: &Tokenizer, token_ids: &[usize]) -> usize {
-        let vocab_size = tokenizer.vocab.len();
+        let vocab_size = tokenizer.vocab.len() + 1; // Include BOS
         let seq_len = token_ids.len();
         let zero = tape.scalar(0.0);
         let shape = Shape::new(&[seq_len, vocab_size]);
@@ -162,10 +146,10 @@ impl Gpt {
         let score_scale = tape.pow(head_dim, 0.5);
         let seq_len = token_ids.len();
         let head_shape = Shape::new(&[1, N_HEAD, seq_len, HEAD_DIM]);
-        let embedding = self.embedding(tape, tokenizer, token_ids);
         let causal_mask = tape.causal_mask(seq_len);
+        let out_shape = Shape::new(&[seq_len, D_MODEL]);
 
-        let mut x = tape.matmul(embedding, self.wte);
+        let mut x = self.embedding(tape, tokenizer, token_ids);
         x = tape.rmsnorm(x);
 
         for layer in &mut self.layers {
@@ -183,10 +167,12 @@ impl Gpt {
 
             let k_t = tape.transpose(k, -2, -1);
             let mut scores = tape.matmul(q, k_t);
-            scores = tape.mul(scores, causal_mask);
             scores = tape.div(scores, score_scale);
+            scores = tape.add(scores, causal_mask);
             scores = tape.softmax(scores);
             scores = tape.matmul(scores, v);
+            scores = tape.transpose(scores, -3, -2);
+            scores = tape.reshape(scores, out_shape);
 
             x = tape.matmul(scores, layer.attn_wo);
             x = tape.add(x, x_residual);
@@ -222,6 +208,7 @@ impl Gpt {
         }
 
         let num_lines = offsets.len();
+        let mut token_ids = vec![];
 
         for step in 0..TRAINING_STEPS {
             let start = Instant::now();
@@ -237,7 +224,7 @@ impl Gpt {
                 .expect("no line at offset")
                 .expect("failed to read line");
 
-            let token_ids = tokenizer.encode(&input);
+            tokenizer.encode(&input, &mut token_ids);
             let input_ids = &token_ids[..token_ids.len() - 1];
             let target_ids = &token_ids[1..];
 
@@ -264,16 +251,16 @@ impl Gpt {
             let v_pow = tape.pow(b2, stepf + 1.0);
             let v_numerator = tape.sub(one, v_pow);
 
-            for i in 0..self.params {
+            for i in 0..self.n_weights {
                 if let Some(grad) = tape.values[i].grad {
-                    let mi = self.params + i;
+                    let mi = self.n_weights + i;
                     let m1 = tape.mul(mi, b1);
                     let m2 = tape.mul(grad, b1_complement);
                     let m3 = tape.add(m1, m2);
                     tape.copy_data(m3, mi);
 
                     let grad_squared = tape.pow(grad, 2.0);
-                    let vi = self.params * 2 + i;
+                    let vi = self.n_weights * 2 + i;
                     let v1 = tape.mul(vi, b2);
                     let v2 = tape.mul(grad_squared, b2_complement);
                     let v3 = tape.add(v1, v2);
@@ -311,34 +298,39 @@ impl Gpt {
         }
     }
 
-    pub fn infer(&mut self, _tape: &mut Tape, _tokenizer: &mut Tokenizer) {
-        /*
+    pub fn infer(&mut self, tape: &mut Tape, tokenizer: &mut Tokenizer) {
         for _ in 0..N_SAMPLES {
             let mut rng = thread_rng();
-            let mut token_id = tokenizer.bos;
-            let mut sample = vec![];
+            let mut token_ids = vec![tokenizer.bos];
 
-            for pos_id in 0..N_CONTEXT {
-                let logits = self.forward(tape, token_id, pos_id);
+            for _ in 0..N_CONTEXT {
+                let logits = self.forward(tape, tokenizer, &token_ids);
+                let logits = tape.select(logits, 0, token_ids.len() - 1);
                 let probs = tape.softmax(logits);
+
                 let offset = tape.values[probs].offset;
                 let shape = tape.values[probs].shape;
                 let weights = &tape.data[offset..offset + shape.product()];
                 let dist = WeightedIndex::new(weights).unwrap();
-                token_id = dist.sample(&mut rng);
+                let token_id = dist.sample(&mut rng);
 
                 if token_id == tokenizer.bos {
                     break;
                 }
 
-                let t = tokenizer.vocab[token_id];
-                sample.extend(t.bytes.iter().flatten().copied());
+                token_ids.push(token_id);
+                self.truncate(tape);
             }
 
-            self.truncate(tape);
+            let mut sample = vec![];
+            for token_id in token_ids {
+                if let Some(t) = tokenizer.vocab.get(token_id) {
+                    sample.extend(t.bytes.iter().flatten().copied());
+                };
+            }
 
             let s = String::from_utf8(sample).expect("invalid utf-8");
             println!("Sample: {}", s);
-        }*/
+        }
     }
 }
