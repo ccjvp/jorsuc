@@ -66,14 +66,14 @@ impl Gpt {
         let lm_head = tape.random(Shape::new(&[D_MODEL, vocab_size]), 1.0);
         let layers = Vec::from_iter((0..N_LAYER).map(|_| Layer::new(tape, D_MODEL)));
         let n_params = tape.data.len();
-        let n_weights = tape.values.len();
+        let n_weights = tape.weights.len();
 
         // Add moment buffers
-        let n = tape.values.len();
+        let n = tape.weights.len();
         for _ in 0..2 {
             for i in 0..n {
                 let data_offset = tape.data.len();
-                let shape = tape.values[i].shape;
+                let shape = tape.weights[i].shape;
 
                 for _ in 0..shape.product() {
                     tape.data.push(0.0);
@@ -94,21 +94,21 @@ impl Gpt {
 
     // Times 3 to account for moment buffers
     fn truncate(&mut self, tape: &mut Tape) {
-        tape.values.truncate(self.n_weights * 3);
+        tape.weights.truncate(self.n_weights * 3);
         tape.data.truncate(self.n_params * 3);
         tape.inputs.truncate(0);
     }
 
     // TODO: Get rid of the one hot materialization
     fn cross_entropy(&mut self, tape: &mut Tape, logits: usize, target_ids: &[usize]) -> usize {
-        let logits_shape = tape.values[logits].shape;
+        let logits_shape = tape.weights[logits].shape;
         let vocab_size = logits_shape.get_dim(-1);
         let zero = tape.scalar(0.0);
         let one_hot = tape.reshape(zero, logits_shape);
         let eps = tape.scalar(1e-9);
 
         for (i, token_id) in target_ids.iter().copied().enumerate() {
-            let d_i = tape.values[one_hot].offset(i * vocab_size + token_id);
+            let d_i = tape.weights[one_hot].offset(i * vocab_size + token_id);
             tape.data[d_i] = 1.0;
         }
 
@@ -133,7 +133,7 @@ impl Gpt {
         let one_hot = tape.reshape(zero, shape);
 
         for (i, token_id) in token_ids.iter().copied().enumerate() {
-            let d_i = tape.values[one_hot].offset(i * vocab_size + token_id);
+            let d_i = tape.weights[one_hot].offset(i * vocab_size + token_id);
             tape.data[d_i] = 1.0;
         }
 
@@ -230,7 +230,7 @@ impl Gpt {
 
             let logits = self.forward(tape, tokenizer, &input_ids);
             let loss = self.cross_entropy(tape, logits, &target_ids);
-            let loss_f = tape.data[tape.values[loss].offset];
+            let loss_f = tape.data[tape.weights[loss].offset];
 
             tape.backward();
 
@@ -252,7 +252,7 @@ impl Gpt {
             let v_numerator = tape.sub(one, v_pow);
 
             for i in 0..self.n_weights {
-                if let Some(grad) = tape.values[i].grad {
+                if let Some(grad) = tape.weights[i].grad {
                     let mi = self.n_weights + i;
                     let m1 = tape.mul(mi, b1);
                     let m2 = tape.mul(grad, b1_complement);
@@ -277,7 +277,7 @@ impl Gpt {
                     let d = tape.add(i, neg_change);
 
                     tape.copy_data(d, i);
-                    tape.values[i].grad = None;
+                    tape.weights[i].grad = None;
                 }
             }
 
@@ -308,8 +308,8 @@ impl Gpt {
                 let logits = tape.select(logits, 0, token_ids.len() - 1);
                 let probs = tape.softmax(logits);
 
-                let offset = tape.values[probs].offset;
-                let shape = tape.values[probs].shape;
+                let offset = tape.weights[probs].offset;
+                let shape = tape.weights[probs].shape;
                 let weights = &tape.data[offset..offset + shape.product()];
                 let dist = WeightedIndex::new(weights).unwrap();
                 let token_id = dist.sample(&mut rng);
