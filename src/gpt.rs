@@ -8,7 +8,7 @@ use std::time::Instant;
 use std::{fs, vec};
 
 const D_MODEL: usize = 64;
-const N_HEAD: usize = 6;
+const N_HEAD: usize = 4;
 const N_LAYER: usize = 6;
 const HEAD_DIM: usize = D_MODEL / N_HEAD;
 const TRAINING_STEPS: usize = 100;
@@ -32,14 +32,14 @@ impl Layer {
         // GPT-2 trick to stop the residual stream's standard deviation
         // from growing with depth at initialization
         let wo_fc2_scale = 1.0 / (2.0 * N_LAYER as f32).sqrt();
-        let attn_shape = Shape::new(&[n_embed, n_embed]);
+        let attn_shape = &[n_embed, n_embed];
         let attn_wq = tape.random(attn_shape, 1.0);
         let attn_wk = tape.random(attn_shape, 1.0);
         let attn_wv = tape.random(attn_shape, 1.0);
         let attn_wo = tape.random(attn_shape, wo_fc2_scale);
 
-        let mlp_fc1 = tape.random(Shape::new(&[n_embed, n_embed * 4]), 1.0);
-        let mlp_fc2 = tape.random(Shape::new(&[n_embed * 4, n_embed]), wo_fc2_scale);
+        let mlp_fc1 = tape.random(&[n_embed, n_embed * 4], 1.0);
+        let mlp_fc2 = tape.random(&[n_embed * 4, n_embed], wo_fc2_scale);
 
         Self {
             attn_wq,
@@ -63,8 +63,8 @@ pub struct Gpt {
 impl Gpt {
     pub fn new(tape: &mut Tape, tokenizer: &Tokenizer) -> Self {
         let vocab_size = tokenizer.vocab.len() + 1;
-        let wte = tape.random(Shape::new(&[vocab_size, D_MODEL]), 1.0);
-        let lm_head = tape.random(Shape::new(&[D_MODEL, vocab_size]), 1.0);
+        let wte = tape.random(&[vocab_size, D_MODEL], 1.0);
+        let lm_head = tape.random(&[D_MODEL, vocab_size], 1.0);
         let layers = Vec::from_iter((0..N_LAYER).map(|_| Layer::new(tape, D_MODEL)));
         let n_params = tape.data.len();
         let n_weights = tape.weights.len();
@@ -102,10 +102,9 @@ impl Gpt {
 
     // TODO: Get rid of the one hot materialization
     fn cross_entropy(&mut self, tape: &mut Tape, logits: usize, target_ids: &[usize]) -> usize {
-        let logits_shape = tape.weights[logits].shape;
-        let vocab_size = logits_shape.get_dim(-1);
-        let zero = tape.scalar(0.0);
-        let one_hot = tape.reshape(zero, logits_shape);
+        let shape = tape.weights[logits].shape;
+        let vocab_size = shape.get_dim(-1);
+        let one_hot = tape.zeros(shape);
         let eps = tape.scalar(1e-9);
 
         for (i, token_id) in target_ids.iter().copied().enumerate() {
@@ -126,12 +125,31 @@ impl Gpt {
         tape.div(x, n)
     }
 
+    pub fn causal_mask(tape: &mut Tape, seq_len: usize) -> usize {
+        let shape = Shape::new(&[seq_len, seq_len]);
+        let init = tape.scalar(f32::NEG_INFINITY);
+        let out = tape.broadcast(init, shape.dims);
+        let out = tape.materialize(out);
+
+        for i in 0..shape.product() {
+            let index = shape.unravel_index(i);
+            let row = index.0[0];
+            let col = index.0[1];
+
+            if col <= row {
+                let d_i = tape.weights[out].offset(i);
+                tape.data[d_i] = 1.0;
+            }
+        }
+
+        out
+    }
+
     fn embedding(&mut self, tape: &mut Tape, tokenizer: &Tokenizer, token_ids: &[usize]) -> usize {
         let vocab_size = tokenizer.vocab.len() + 1; // Include BOS
         let seq_len = token_ids.len();
-        let zero = tape.scalar(0.0);
         let shape = Shape::new(&[seq_len, vocab_size]);
-        let one_hot = tape.reshape(zero, shape);
+        let one_hot = tape.zeros(shape);
 
         for (i, token_id) in token_ids.iter().copied().enumerate() {
             let d_i = tape.weights[one_hot].offset(i * vocab_size + token_id);
@@ -147,7 +165,7 @@ impl Gpt {
         let score_scale = tape.pow(head_dim, 0.5);
         let seq_len = token_ids.len();
         let head_shape = Shape::new(&[1, N_HEAD, seq_len, HEAD_DIM]);
-        let causal_mask = tape.causal_mask(seq_len);
+        let causal_mask = Self::causal_mask(tape, seq_len);
         let out_shape = Shape::new(&[seq_len, D_MODEL]);
 
         let mut x = self.embedding(tape, tokenizer, token_ids);

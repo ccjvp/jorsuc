@@ -3,7 +3,7 @@ use crate::shape::Shape;
 use rand::distributions::Distribution;
 use rand::distributions::Uniform;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Op {
     Add,
     Pow { n: f32 },
@@ -25,7 +25,7 @@ pub enum Op {
     Broadcast,
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct View {
     offset: usize,
     len: usize,
@@ -91,7 +91,7 @@ pub struct Tape {
     pub inputs: Vec<usize>,
 }
 
-// TODO: Tests based on pytorch examples
+// TODO: Numerical tests using generated data
 impl Tape {
     pub fn new() -> Self {
         Self {
@@ -99,26 +99,6 @@ impl Tape {
             data: vec![],
             inputs: vec![],
         }
-    }
-
-    // TODO: Should this be on Gpt?
-    pub fn causal_mask(&mut self, seq_len: usize) -> usize {
-        let shape = Shape::new(&[seq_len, seq_len]);
-        let zero = self.scalar(f32::NEG_INFINITY);
-        let out = self.reshape(zero, shape);
-
-        for i in 0..shape.product() {
-            let index = shape.unravel_index(i);
-            let row = index.0[0];
-            let col = index.0[1];
-
-            if col <= row {
-                let d_i = self.weights[out].offset(i);
-                self.data[d_i] = 1.0;
-            }
-        }
-
-        out
     }
 
     pub fn backward(&mut self) {
@@ -151,7 +131,8 @@ impl Tape {
     }
 
     // Assumes (in, out) weights and uses Kaiming/He init
-    pub fn random(&mut self, shape: Shape, scale: f32) -> usize {
+    pub fn random(&mut self, shape: &[usize], scale: f32) -> usize {
+        let shape = Shape::new(shape);
         let offset = self.data.len();
         let in_dims = shape.dims.0[0];
         let k = (6.0 / in_dims as f32).sqrt();
@@ -189,6 +170,33 @@ impl Tape {
         self.push_weight(offset, shape, None, None, true)
     }
 
+    pub fn zeros(&mut self, shape: Shape) -> usize {
+        let zero = self.scalar(0.0);
+        let zeros = self.broadcast(zero, shape.dims);
+
+        self.materialize(zeros)
+    }
+
+    pub fn ones(&mut self, shape: Shape) -> usize {
+        let one = self.scalar(1.0);
+        let ones = self.broadcast(one, shape.dims);
+
+        self.materialize(ones)
+    }
+
+    #[cfg(test)]
+    pub fn tensor(&mut self, data: &[f32]) -> usize {
+        let n = data.len();
+        assert!(n > 0);
+
+        let offset = self.data.len();
+        let shape = Shape::new(&[n]);
+        assert!(n == 0 || shape.product() == n);
+
+        self.data.extend_from_slice(data);
+        self.push_weight(offset, shape, None, None, true)
+    }
+
     // Chain rule gives dL/dx = dL/dy dy/dx and dL/dy = output.grad
     fn vjp(&mut self, input: usize, output: usize, slot: usize) -> usize {
         let op = self.weights[output].op.unwrap();
@@ -202,14 +210,15 @@ impl Tape {
             Op::Transpose { outer, inner } => self.transpose(v, inner, outer),
             Op::Broadcast => {
                 let output_shape = self.weights[output].shape;
-                let mut input_shape = self.weights[input].shape;
-                input_shape = input_shape.expand(output_shape.rank());
+                let output_rank = output_shape.rank();
+                let input_shape = self.weights[input].shape;
+                let expanded_input = input_shape.expand(output_rank);
 
                 let mut x = v;
-                for (i, dim) in output_shape.dims.0.iter().copied().enumerate() {
-                    if dim != input_shape.dims.0[i] {
+                for i in 0..output_rank {
+                    if output_shape.get_dim(i) != expanded_input.get_dim(i) {
                         x = self.sum(x, Some(i));
-                    };
+                    }
                 }
 
                 self.reshape(x, input_shape)
@@ -217,8 +226,7 @@ impl Tape {
             Op::Select { dim, i } => {
                 let v_shape = self.weights[v].shape;
                 let input_shape = self.weights[input].shape;
-                let zero = self.scalar(0.0);
-                let x = self.reshape(zero, input_shape);
+                let x = self.zeros(input_shape);
                 let x_strides = input_shape.dims.strides();
 
                 for v_k in 0..v_shape.product() {
@@ -249,8 +257,7 @@ impl Tape {
                     slot_start += k_shape.get_dim(dim);
                 }
 
-                let zero = self.scalar(0.0);
-                let x = self.reshape(zero, input_shape);
+                let x = self.zeros(input_shape);
                 for x_k in 0..input_shape.product() {
                     let mut v_index = input_shape.unravel_index(x_k);
                     v_index.0[dim] += slot_start;
@@ -283,9 +290,8 @@ impl Tape {
             // Gradient passed to the first occurance of
             // max for each reduction by convention.
             Op::Max { argmax, .. } => {
-                let zero = self.scalar(0.0);
                 let input_shape = self.weights[input].shape;
-                let j = self.reshape(zero, input_shape);
+                let j = self.zeros(input_shape);
 
                 let argmax_offset = self.weights[argmax].offset;
                 let argmax_shape = self.weights[argmax].shape;
@@ -324,14 +330,13 @@ impl Tape {
                 self.mul(v, j)
             }
             Op::Sum { dim: _ } => {
-                let ones = self.scalar(1.0);
-                let j = self.reshape(ones, self.weights[input].shape);
+                let shape = self.weights[input].shape;
+                let j = self.ones(shape);
                 self.mul(v, j)
             }
             Op::Relu => {
                 let input_shape = self.weights[input].shape;
-                let zero = self.scalar(0.0);
-                let j = self.reshape(zero, input_shape);
+                let j = self.zeros(input_shape);
 
                 for k in 0..input_shape.product() {
                     let k_i = self.weights[input].offset(k);
@@ -346,7 +351,7 @@ impl Tape {
         }
     }
 
-    fn broadcast(&mut self, a: usize, dims: Dims) -> usize {
+    pub fn broadcast(&mut self, a: usize, dims: Dims) -> usize {
         let op = Some(Op::Broadcast);
         let inputs = Some(View::new(self.inputs.len(), 1));
         self.inputs.push(a);
@@ -375,6 +380,9 @@ impl Tape {
     }
 
     pub fn reshape(&mut self, a: usize, to_shape: Shape) -> usize {
+        let from_shape = self.weights[a].shape;
+        assert_eq!(from_shape.product(), to_shape.product());
+
         let data_offset = self.data.len();
         let input_offset = self.inputs.len();
         let inputs = Some(View::new(input_offset, 1));
@@ -388,6 +396,22 @@ impl Tape {
 
         let op = Some(Op::Reshape);
         let shape = Shape::from_dims(to_shape.dims);
+        self.push_weight(data_offset, shape, inputs, op, true)
+    }
+
+    pub fn materialize(&mut self, a: usize) -> usize {
+        let data_offset = self.data.len();
+        let in_shape = self.weights[a].shape;
+
+        let mut iter = self.weights[a].nditer();
+        for _ in 0..in_shape.product() {
+            let a_i = iter.next().unwrap();
+            self.data.push(self.data[a_i]);
+        }
+
+        let op = self.weights[a].op;
+        let shape = Shape::from_dims(in_shape.dims);
+        let inputs = self.weights[a].inputs;
         self.push_weight(data_offset, shape, inputs, op, true)
     }
 
@@ -755,7 +779,7 @@ impl Tape {
         self.elementwise(i, Op::Log, f)
     }
 
-    fn exp(&mut self, i: usize) -> usize {
+    pub fn exp(&mut self, i: usize) -> usize {
         let f = |x: f32| x.exp();
         self.elementwise(i, Op::Exp, f)
     }
@@ -797,5 +821,466 @@ impl Tape {
     pub fn div(&mut self, i: usize, j: usize) -> usize {
         let k = self.pow(j, -1.0);
         self.mul(i, k)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{dims::Dims, shape::Shape, tape::Tape};
+    use pyo3::{PyResult, prelude::*, types::PyDict};
+    use quickcheck::{Arbitrary, Gen, TestResult};
+    use quickcheck_macros::quickcheck;
+    use std::sync::Once;
+
+    static PYTHON_INIT: Once = Once::new();
+
+    fn gen_data(g: &mut Gen, len: usize) -> Vec<f32> {
+        let mut data = vec![];
+
+        while data.len() < len {
+            let value = f32::arbitrary(g);
+            if value.is_finite() {
+                // Avoid overflow
+                data.push(value % 10.0);
+            }
+        }
+
+        data
+    }
+
+    fn gen_shape(g: &mut Gen) -> Vec<usize> {
+        loop {
+            let rank = usize::arbitrary(g) % 4 + 1;
+            let shape: Vec<_> = (0..rank).map(|_| usize::arbitrary(g) % 4 + 1).collect();
+            if shape.iter().product::<usize>() <= 100 {
+                return shape;
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct UnaryData {
+        a: Vec<f32>,
+        shape: Vec<usize>,
+    }
+
+    impl Arbitrary for UnaryData {
+        fn arbitrary(g: &mut Gen) -> Self {
+            let shape = gen_shape(g);
+            let len = shape.iter().product();
+
+            Self {
+                a: gen_data(g, len),
+                shape,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct BinaryData {
+        a: Vec<f32>,
+        b: Vec<f32>,
+        shape: Vec<usize>,
+    }
+
+    impl Arbitrary for BinaryData {
+        fn arbitrary(g: &mut Gen) -> Self {
+            let shape = gen_shape(g);
+            let len = shape.iter().product();
+
+            Self {
+                a: gen_data(g, len),
+                b: gen_data(g, len),
+                shape,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct MatrixData {
+        a: Vec<f32>,
+        b: Vec<f32>,
+    }
+
+    impl Arbitrary for MatrixData {
+        fn arbitrary(g: &mut Gen) -> Self {
+            Self {
+                a: gen_data(g, 6),
+                b: gen_data(g, 6),
+            }
+        }
+    }
+
+    fn tensor<'py>(
+        torch: &Bound<'py, PyModule>,
+        data: &[f32],
+        shape: &[usize],
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let args = (data.to_vec(),);
+        let kwargs = PyDict::new(torch.py());
+        kwargs.set_item("device", "cpu")?;
+        kwargs.set_item("requires_grad", true)?;
+
+        let t = torch.call_method("tensor", args, Some(&kwargs))?;
+        t.call_method1("reshape", (shape.to_vec(),))
+    }
+
+    // Returns items in logical order
+    fn flat_list(t: Bound<'_, PyAny>) -> PyResult<Vec<f32>> {
+        let t = t.call_method0("flatten")?;
+        t.call_method0("tolist")?.extract()
+    }
+
+    fn init_py() {
+        PYTHON_INIT.call_once(Python::initialize);
+    }
+
+    fn compare(tape: &mut Tape, expected: Bound<'_, PyAny>, actual: usize) -> PyResult<TestResult> {
+        let expected = flat_list(expected).unwrap();
+
+        let mut iter = tape.weights[actual].nditer().enumerate();
+        while let Some((expected_i, actual_i)) = iter.next() {
+            let expected = expected[expected_i];
+            let actual = tape.data[actual_i];
+
+            if expected != actual {
+                let tolerance = 1e-5 * expected.abs().max(actual.abs()).max(1.0);
+                let diff = (expected - actual).abs();
+
+                assert!(diff <= tolerance);
+            }
+        }
+
+        Ok(TestResult::passed())
+    }
+
+    fn test_unary(
+        data: UnaryData,
+        method: &str,
+        tape_op: fn(&mut Tape, usize) -> usize,
+    ) -> PyResult<TestResult> {
+        init_py();
+
+        Python::attach(|py| {
+            let torch = py.import("torch")?;
+            let a = tensor(&torch, &data.a, &data.shape)?;
+            let x = a.call_method0(method)?;
+
+            let mut tape = Tape::new();
+            let a = tape.tensor(&data.a);
+            let y = tape_op(&mut tape, a);
+
+            compare(&mut tape, x, y)
+        })
+    }
+
+    fn test_binary(
+        data: BinaryData,
+        method: &str,
+        tape_op: fn(&mut Tape, usize, usize) -> usize,
+    ) -> PyResult<TestResult> {
+        init_py();
+
+        Python::attach(|py| {
+            let torch = py.import("torch")?;
+            let a = tensor(&torch, &data.a, &data.shape)?;
+            let b = tensor(&torch, &data.b, &data.shape)?;
+            let x = a.call_method1(method, (&b,))?;
+
+            let mut tape = Tape::new();
+            let a = tape.tensor(&data.a);
+            let b = tape.tensor(&data.b);
+            let y = tape_op(&mut tape, a, b);
+
+            compare(&mut tape, x, y)
+        })
+    }
+
+    #[quickcheck]
+    fn test_neg(data: UnaryData) -> PyResult<TestResult> {
+        test_unary(data, "neg", Tape::neg)
+    }
+
+    #[quickcheck]
+    fn test_relu(data: UnaryData) -> PyResult<TestResult> {
+        test_unary(data, "relu", Tape::relu)
+    }
+
+    #[quickcheck]
+    fn test_exp(data: UnaryData) -> PyResult<TestResult> {
+        test_unary(data, "exp", Tape::exp)
+    }
+
+    #[quickcheck]
+    fn test_pow(mut data: UnaryData) -> PyResult<TestResult> {
+        for value in &mut data.a {
+            *value = value.abs();
+        }
+
+        test_unary(data, "square", |tape, a| tape.pow(a, 2.0))
+    }
+
+    #[quickcheck]
+    fn test_log(mut data: UnaryData) -> PyResult<TestResult> {
+        for value in &mut data.a {
+            *value = value.abs() + 1.0;
+        }
+
+        test_unary(data, "log", Tape::log)
+    }
+
+    #[quickcheck]
+    fn test_sum(data: UnaryData) -> PyResult<TestResult> {
+        test_unary(data, "sum", |tape, a| tape.sum(a, None))
+    }
+
+    #[quickcheck]
+    fn test_add(data: BinaryData) -> PyResult<TestResult> {
+        test_binary(data, "__add__", Tape::add)
+    }
+
+    #[quickcheck]
+    fn test_mul(data: BinaryData) -> PyResult<TestResult> {
+        test_binary(data, "__mul__", Tape::mul)
+    }
+
+    #[quickcheck]
+    fn test_sub(data: BinaryData) -> PyResult<TestResult> {
+        test_binary(data, "__sub__", Tape::sub)
+    }
+
+    #[quickcheck]
+    fn test_div(mut data: BinaryData) -> PyResult<TestResult> {
+        for value in &mut data.b {
+            if value.abs() < 0.1 {
+                *value = 1.0;
+            }
+        }
+
+        test_binary(data, "__truediv__", Tape::div)
+    }
+
+    #[quickcheck]
+    fn test_sum_dim(data: UnaryData) -> PyResult<TestResult> {
+        init_py();
+
+        Python::attach(|py| {
+            let torch = py.import("torch")?;
+            let shape = &[1, data.a.len()];
+            let a = tensor(&torch, &data.a[..], shape)?;
+            let x = a.call_method1("sum", (1, true))?;
+
+            let mut tape = Tape::new();
+            let a = tape.tensor(&data.a);
+            let a = tape.reshape(a, Shape::new(shape));
+            let y = tape.sum(a, Some(1));
+
+            compare(&mut tape, x, y)
+        })
+    }
+
+    #[quickcheck]
+    fn test_broadcast(data: UnaryData) -> PyResult<TestResult> {
+        init_py();
+
+        Python::attach(|py| {
+            let torch = py.import("torch")?;
+            let from = &[1, data.a.len()];
+            let a = tensor(&torch, &data.a, from)?;
+            let args = (vec![2, data.a.len()],);
+            let x = a.call_method1("expand", args)?;
+
+            let mut tape = Tape::new();
+            let a = tape.tensor(&data.a);
+            let a = tape.reshape(a, Shape::new(from));
+            let to = Dims([2, data.a.len(), 0, 0]);
+            let y = tape.broadcast(a, to);
+
+            compare(&mut tape, x, y)
+        })
+    }
+
+    #[quickcheck]
+    fn test_select(data: UnaryData) -> PyResult<TestResult> {
+        init_py();
+
+        Python::attach(|py| {
+            let torch = py.import("torch")?;
+            let values = [data.a.as_slice(), data.a.as_slice()].concat();
+            let a = tensor(&torch, &values, &[2, data.a.len()])?;
+            let x = a.call_method1("select", (0, 1))?;
+
+            let mut tape = Tape::new();
+            let a = tape.tensor(&values);
+            let a = tape.reshape(a, Shape::new(&[2, data.a.len()]));
+            let y = tape.select(a, 0, 1);
+
+            compare(&mut tape, x, y)
+        })
+    }
+
+    #[quickcheck]
+    fn test_rmsnorm(data: UnaryData) -> PyResult<TestResult> {
+        init_py();
+
+        Python::attach(|py| {
+            let torch = py.import("torch")?;
+            let a = tensor(&torch, &data.a, &data.shape)?;
+            let squared = a.call_method1("pow", (2.0,))?;
+            let mean = squared.call_method1("mean", (-1, true))?;
+            let mean = mean.call_method1("add", (1e-5,))?;
+            let scale = mean.call_method1("pow", (-0.5,))?;
+            let x = a.call_method1("mul", (&scale,))?;
+
+            let mut tape = Tape::new();
+            let a = tape.tensor(&data.a);
+            let a = tape.reshape(a, Shape::new(&data.shape));
+            let y = tape.rmsnorm(a);
+
+            compare(&mut tape, x, y)
+        })
+    }
+
+    #[quickcheck]
+    fn test_softmax(data: UnaryData) -> PyResult<TestResult> {
+        init_py();
+
+        Python::attach(|py| {
+            let torch = py.import("torch")?;
+            let a = tensor(&torch, &data.a, &data.shape)?;
+            let x = a.call_method1("softmax", (-1,))?;
+
+            let mut tape = Tape::new();
+            let a = tape.tensor(&data.a);
+            let a = tape.reshape(a, Shape::new(&data.shape));
+            let y = tape.softmax(a);
+
+            compare(&mut tape, x, y)
+        })
+    }
+
+    #[quickcheck]
+    fn test_reshape(data: UnaryData) -> PyResult<TestResult> {
+        init_py();
+
+        Python::attach(|py| {
+            let torch = py.import("torch")?;
+            let to = [1, data.a.len()];
+            let a = tensor(&torch, &data.a, &[data.a.len()])?;
+            let x = a.call_method1("reshape", (to.to_vec(),))?;
+
+            let mut tape = Tape::new();
+            let a = tape.tensor(&data.a);
+            let y = tape.reshape(a, Shape::new(&to));
+
+            compare(&mut tape, x, y)
+        })
+    }
+
+    #[quickcheck]
+    fn test_transpose(data: MatrixData) -> PyResult<TestResult> {
+        init_py();
+
+        Python::attach(|py| {
+            let torch = py.import("torch")?;
+            let a = tensor(&torch, &data.a, &[2, 3])?;
+            let x = a.call_method1("transpose", (0, 1))?;
+
+            let mut tape = Tape::new();
+            let a = tape.tensor(&data.a);
+            let a = tape.reshape(a, Shape::new(&[2, 3]));
+            let y = tape.transpose(a, 0, 1);
+
+            compare(&mut tape, x, y)
+        })
+    }
+
+    #[quickcheck]
+    fn test_matmul(data: MatrixData) -> PyResult<TestResult> {
+        init_py();
+
+        Python::attach(|py| {
+            let torch = py.import("torch")?;
+            let a = tensor(&torch, &data.a, &[2, 3])?;
+            let b = tensor(&torch, &data.b, &[3, 2])?;
+            let x = a.call_method1("matmul", (&b,))?;
+
+            let mut tape = Tape::new();
+            let a = tape.tensor(&data.a);
+            let a = tape.reshape(a, Shape::new(&[2, 3]));
+            let b = tape.tensor(&data.b);
+            let b = tape.reshape(b, Shape::new(&[3, 2]));
+            let y = tape.matmul(a, b);
+
+            compare(&mut tape, x, y)
+        })
+    }
+
+    #[quickcheck]
+    fn test_pipeline_backward(mut data: UnaryData) -> PyResult<TestResult> {
+        init_py();
+
+        // Keep the inputs away from ReLU's nondifferentiable point while still
+        // exercising a nontrivial graph with broadcasting and a reduction.
+        for value in &mut data.a {
+            *value = (*value).clamp(-5.0, 5.0);
+            if value.abs() < 0.1 {
+                *value = 0.2;
+            }
+        }
+
+        Python::attach(|py| {
+            let torch = py.import("torch")?;
+            let shape = [1, data.a.len()];
+
+            let x = tensor(&torch, &data.a[..1], &[])?;
+            x.call_method0("retain_grad")?;
+
+            let input = tensor(&torch, &data.a, &[data.a.len(), 1])?;
+            let expanded = x.call_method1("expand", (shape.to_vec(),))?;
+            let projected = expanded.call_method1("matmul", (&input,))?;
+            let bias = torch.call_method1("tensor", (0.25_f32,))?;
+            let shifted = projected.call_method1("add", (&bias,))?;
+            let scaled = shifted.call_method1("mul", (&bias,))?;
+            let negated = scaled.call_method0("neg")?;
+            let exponentiated = negated.call_method0("exp")?;
+            let logged = exponentiated.call_method0("log")?;
+            let activated = logged.call_method0("relu")?;
+            let squared = activated.call_method1("pow", (2.0_f32,))?;
+            let loss = squared.call_method0("sum")?;
+            loss.call_method0("backward")?;
+            let expected = flat_list(x.getattr("grad")?)?;
+
+            let mut tape = Tape::new();
+            let source = tape.scalar(data.a[0]);
+            let expanded = tape.broadcast(source, Shape::new(&shape).dims);
+            let input = tape.tensor(&data.a);
+            let input = tape.reshape(input, Shape::new(&[data.a.len(), 1]));
+            let projected = tape.matmul(expanded, input);
+            let bias = tape.scalar(0.25);
+            let shifted = tape.add(projected, bias);
+            let scaled = tape.mul(shifted, bias);
+            let negated = tape.neg(scaled);
+            let exponentiated = tape.exp(negated);
+            let logged = tape.log(exponentiated);
+            let activated = tape.relu(logged);
+            let squared = tape.pow(activated, 2.0);
+            tape.sum(squared, None);
+            tape.backward();
+
+            let grad = tape.weights[source].grad.unwrap();
+            let weight = tape.weights[grad];
+            let actual: Vec<_> = weight.nditer().map(|i| tape.data[i]).collect();
+
+            assert_eq!(expected.len(), actual.len());
+            for (expected, actual) in expected.into_iter().zip(actual) {
+                let tolerance = 1e-5 * expected.abs().max(actual.abs()).max(1.0);
+                let diff = (expected - actual).abs();
+
+                assert!(diff <= tolerance);
+            }
+
+            Ok(TestResult::passed())
+        })
     }
 }
