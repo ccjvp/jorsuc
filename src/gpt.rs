@@ -1,4 +1,5 @@
-use crate::tape::{Shape, Tape};
+use crate::shape::Shape;
+use crate::tape::Tape;
 use crate::tokenizer::{N_CONTEXT, Tokenizer};
 use rand::distributions::{Distribution, WeightedIndex};
 use rand::thread_rng;
