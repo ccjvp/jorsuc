@@ -25,8 +25,6 @@ pub enum Op {
     Broadcast,
 }
 
-type Dims = [Option<usize>; MAX_RANK];
-
 pub trait ShapeIndex {
     fn to_isize(self) -> isize;
 }
@@ -49,69 +47,84 @@ impl ShapeIndex for isize {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Dims([usize; MAX_RANK]);
+
+impl Dims {
+    // Shape strides should be used if there is not a need to recompute
+    fn strides(self) -> Self {
+        let mut strides = Self::default();
+        let n = self.0.iter().take_while(|&d| *d != 0).count();
+        for i in 0..n {
+            strides.0[i] = Self::product(&self.0[i + 1..]);
+        }
+        strides
+    }
+
+    fn dot(self, b: Dims) -> usize {
+        let mut dot = 0;
+        for (i, v) in self.0.iter().enumerate() {
+            dot += v * b.0[i];
+        }
+        dot
+    }
+
+    fn add(self, new_dims: &[usize]) -> Self {
+        let mut out = self.clone();
+        let mut new_iter = new_dims.iter();
+
+        while let Some(pos) = out.0.iter().position(|&d| d == 0) {
+            match new_iter.next() {
+                Some(d) => out.0[pos] = *d,
+                None => break,
+            }
+        }
+
+        out
+    }
+
+    fn insert(self, dim: usize, i: usize) -> Dims {
+        let mut out = self.clone();
+        for j in (dim..self.0.len() - 1).rev() {
+            out.0[j + 1] = out.0[j];
+        }
+        out.0[dim] = i;
+        out
+    }
+
+    fn product(dims: &[usize]) -> usize {
+        dims.iter().take_while(|d| **d != 0).product()
+    }
+
+    fn rank(self) -> usize {
+        self.0.iter().take_while(|&d| *d != 0).count()
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Shape {
     dims: Dims,
     strides: Dims,
 }
 
-// Shape strides should be used if there is not a need to recompute
-fn get_strides(dims: Dims) -> Dims {
-    let mut strides = Dims::default();
-    let n = dims.iter().flatten().count();
-    for i in 0..n {
-        strides[i] = Some(dims[i + 1..].iter().flatten().product());
-    }
-    strides
-}
-
-fn dot_dims(a: Dims, b: Dims) -> usize {
-    let mut dot = 0;
-    for (i, v) in a.iter().flatten().enumerate() {
-        dot += v * b[i].unwrap();
-    }
-    dot
-}
-
-fn add_dims(base_dims: Dims, new_dims: &[usize]) -> Dims {
-    let mut out_dims = base_dims;
-    let mut out_slots = out_dims.iter_mut().filter(|x| x.is_none());
-    for &v in new_dims {
-        match out_slots.next() {
-            Some(slot) => *slot = Some(v),
-            None => panic!("Failed to add dims"),
-        }
-    }
-    out_dims
-}
-
-fn insert_dim(dims: Dims, dim: usize, i: usize) -> Dims {
-    let mut out = dims;
-    for j in (dim..dims.len() - 1).rev() {
-        out[j + 1] = out[j];
-    }
-    out[dim] = Some(i);
-    out
-}
-
 impl Shape {
     pub fn new(a: &[usize]) -> Self {
         let mut dims = Dims::default();
         for i in 0..a.len() {
-            dims[i] = Some(a[i]);
+            dims.0[i] = a[i];
         }
 
-        let strides = get_strides(dims);
+        let strides = dims.strides();
         Self { dims, strides }
     }
 
     fn from_dims(dims: Dims) -> Self {
-        let strides = get_strides(dims);
+        let strides = dims.strides();
         Self { dims, strides }
     }
 
     pub fn rank(&self) -> usize {
-        self.dims.iter().flatten().count()
+        self.dims.rank()
     }
 
     fn real_index(&self, i: isize) -> usize {
@@ -127,9 +140,9 @@ impl Shape {
         let mut index = Dims::default();
 
         let mut i = i.clone();
-        for j in (0..self.dims.iter().flatten().count()).rev() {
-            let dim = self.dims[j].unwrap();
-            index[j] = Some(i % dim);
+        for j in (0..self.rank()).rev() {
+            let dim = self.dims.0[j];
+            index.0[j] = i % dim;
             i = i / dim;
         }
 
@@ -143,10 +156,10 @@ impl Shape {
         } else {
             let mut out = self.clone();
             let diff = n - rank;
-            out.dims.copy_within(0..rank, diff);
-            out.dims[..diff].fill(Some(1));
-            out.strides.copy_within(0..rank, diff);
-            out.strides[..diff].fill(Some(0));
+            out.dims.0.copy_within(0..rank, diff);
+            out.dims.0[..diff].fill(1);
+            out.strides.0.copy_within(0..rank, diff);
+            out.strides.0[..diff].fill(0);
             out
         }
     }
@@ -154,13 +167,13 @@ impl Shape {
     pub fn get_dim<I: ShapeIndex>(&self, i: I) -> usize {
         let i = i.to_isize();
         let i = self.real_index(i);
-        self.dims[i].unwrap()
+        self.dims.0[i]
     }
 
     fn get_stride<I: ShapeIndex>(&self, i: I) -> usize {
         let i = i.to_isize();
         let i = self.real_index(i);
-        self.strides[i].unwrap()
+        self.strides.0[i]
     }
 
     fn squeeze<I: ShapeIndex>(&self, i: I) -> Self {
@@ -170,15 +183,17 @@ impl Shape {
     }
 
     fn broadcast(&self, other: Self) -> Dims {
-        let n = self.rank().max(other.rank());
+        let self_rank = self.rank();
+        let other_rank = other.rank();
+        let mut self_iter = self.dims.0.iter().take(self_rank).rev();
+        let mut other_iter = other.dims.0.iter().take(other_rank).rev();
 
-        let mut self_dims = self.dims.iter().flatten().copied().rev();
-        let mut other_dims = other.dims.iter().flatten().copied().rev();
+        let n = self_rank.max(other_rank);
         let mut out_dims = Dims::default();
         for i in (0..n).rev() {
-            let a = self_dims.next();
-            let b = other_dims.next();
-            out_dims[i] = a.max(b);
+            let a = self_iter.next();
+            let b = other_iter.next();
+            out_dims.0[i] = a.max(b).copied().unwrap();
         }
 
         out_dims
@@ -191,23 +206,23 @@ impl Shape {
         } else {
             let mut out = self.clone();
             for i in r - 2..r {
-                out.dims[i] = None;
-                out.strides[i] = None;
+                out.dims.0[i] = 0;
+                out.strides.0[i] = 0;
             }
             out
         }
     }
 
     pub fn product(&self) -> usize {
-        self.dims.iter().flatten().product()
+        Dims::product(&self.dims.0)
     }
 
     fn drop(&self, i: usize) -> Self {
         let mut out = self.clone();
-        out.dims[i..].rotate_left(1);
-        out.strides[i..].rotate_left(1);
-        out.dims[MAX_RANK - 1] = None;
-        out.strides[MAX_RANK - 1] = None;
+        out.dims.0[i..].rotate_left(1);
+        out.strides.0[i..].rotate_left(1);
+        out.dims.0[MAX_RANK - 1] = 0;
+        out.strides.0[MAX_RANK - 1] = 0;
         out
     }
 
@@ -289,7 +304,7 @@ impl Tensor {
             self.offset + i
         } else {
             let index = self.shape.unravel_index(i);
-            self.offset + dot_dims(index, self.shape.strides)
+            self.offset + index.dot(self.shape.strides)
         }
     }
 
@@ -322,8 +337,8 @@ impl Tape {
 
         for i in 0..shape.product() {
             let index = shape.unravel_index(i);
-            let row = index[0].unwrap();
-            let col = index[1].unwrap();
+            let row = index.0[0];
+            let col = index.0[1];
 
             if col <= row {
                 let d_i = self.weights[out].offset(i);
@@ -366,7 +381,7 @@ impl Tape {
     // Assumes (in, out) weights and uses Kaiming/He init
     pub fn random(&mut self, shape: Shape, scale: f32) -> usize {
         let offset = self.data.len();
-        let in_dims = shape.dims[0].unwrap();
+        let in_dims = shape.dims.0[0];
         let k = (6.0 / in_dims as f32).sqrt();
         let dist = Uniform::new(-k, k);
         let len = shape.product();
@@ -376,7 +391,7 @@ impl Tape {
             self.data.push(dist.sample(&mut rng) * scale);
         }
 
-        self.push(Tensor::new(offset, shape, None, None, true))
+        self.push_weight(offset, shape, None, None, true)
     }
 
     pub fn select(&mut self, a: usize, dim: usize, i: usize) -> usize {
@@ -391,7 +406,7 @@ impl Tape {
         let in_offset = self.weights[a].offset;
         let dim_offset = in_shape.get_stride(dim) * i;
         let data_offset = in_offset + dim_offset;
-        self.push(Tensor::new(data_offset, out_shape, inputs, op, false))
+        self.push_weight(data_offset, out_shape, inputs, op, false)
     }
 
     pub fn scalar(&mut self, value: f32) -> usize {
@@ -399,7 +414,7 @@ impl Tape {
         let shape = Shape::new(&[]);
 
         self.data.push(value);
-        self.push(Tensor::new(offset, shape, None, None, true))
+        self.push_weight(offset, shape, None, None, true)
     }
 
     // Chain rule gives dL/dx = dL/dy dy/dx and dL/dy = output.grad
@@ -419,8 +434,8 @@ impl Tape {
                 input_shape = input_shape.expand(output_shape.rank());
 
                 let mut x = v;
-                for (i, dim) in output_shape.dims.iter().copied().enumerate() {
-                    if dim != input_shape.dims[i] {
+                for (i, dim) in output_shape.dims.0.iter().copied().enumerate() {
+                    if dim != input_shape.dims.0[i] {
                         x = self.sum(x, Some(i));
                     };
                 }
@@ -432,7 +447,7 @@ impl Tape {
                 let input_shape = self.weights[input].shape;
                 let zero = self.scalar(0.0);
                 let x = self.reshape(zero, input_shape);
-                let x_strides = get_strides(input_shape.dims);
+                let x_strides = input_shape.dims.strides();
 
                 for v_k in 0..v_shape.product() {
                     // Select sliced the input along dim at index i and
@@ -440,8 +455,8 @@ impl Tape {
                     // index on the jacobian we need to step along the slice
                     // on the input shape.
                     let v_index = v_shape.unravel_index(v_k);
-                    let x_index = insert_dim(v_index, dim, i);
-                    let x_k = dot_dims(x_index, x_strides);
+                    let x_index = v_index.insert(dim, i);
+                    let x_k = x_index.dot(x_strides);
 
                     let v_i = self.weights[v].offset(v_k);
                     let x_i = self.weights[x].offset + x_k;
@@ -454,7 +469,7 @@ impl Tape {
                 let input_shape = self.weights[input].shape;
                 let input_offset = self.weights[output].inputs.unwrap().offset;
                 let v_shape = self.weights[v].shape;
-                let v_strides = get_strides(v_shape.dims);
+                let v_strides = v_shape.dims.strides();
 
                 let mut slot_start = 0;
                 for k in input_offset..input_offset + slot {
@@ -466,8 +481,8 @@ impl Tape {
                 let x = self.reshape(zero, input_shape);
                 for x_k in 0..input_shape.product() {
                     let mut v_index = input_shape.unravel_index(x_k);
-                    *v_index[dim].as_mut().unwrap() += slot_start;
-                    let v_k = dot_dims(v_index, v_strides);
+                    v_index.0[dim] += slot_start;
+                    let v_k = v_index.dot(v_strides);
 
                     let v_i = self.weights[v].offset(v_k);
                     let x_i = self.weights[x].offset + x_k;
@@ -570,21 +585,21 @@ impl Tape {
 
         let mut strides = in_shape.strides;
         for i in 0..in_rank {
-            if in_dims[i] == Some(1) {
-                strides[i] = Some(0);
+            if in_dims.0[i] == 1 {
+                strides.0[i] = 0;
             }
         }
 
-        let out_rank = dims.iter().flatten().count();
+        let out_rank = dims.rank();
         let rank_diff = out_rank - in_rank;
         if rank_diff > 0 {
-            strides.copy_within(0..in_rank, rank_diff);
-            strides[..rank_diff].fill(Some(0));
+            strides.0.copy_within(0..in_rank, rank_diff);
+            strides.0[..rank_diff].fill(0);
         }
 
         let out_shape = Shape { dims, strides };
         let offset = self.weights[a].offset;
-        self.push(Tensor::new(offset, out_shape, inputs, op, false))
+        self.push_weight(offset, out_shape, inputs, op, false)
     }
 
     pub fn reshape(&mut self, a: usize, to_shape: Shape) -> usize {
@@ -601,7 +616,7 @@ impl Tape {
 
         let op = Some(Op::Reshape);
         let shape = Shape::from_dims(to_shape.dims);
-        self.push(Tensor::new(data_offset, shape, inputs, op, true))
+        self.push_weight(data_offset, shape, inputs, op, true)
     }
 
     pub fn transpose(&mut self, a: usize, outer: isize, inner: isize) -> usize {
@@ -615,12 +630,12 @@ impl Tape {
 
         let inner = in_shape.real_index(inner);
         let outer = in_shape.real_index(outer);
-        out_shape.dims[inner] = in_shape.dims[outer];
-        out_shape.dims[outer] = in_shape.dims[inner];
-        out_shape.strides[inner] = in_shape.strides[outer];
-        out_shape.strides[outer] = in_shape.strides[inner];
+        out_shape.dims.0[inner] = in_shape.dims.0[outer];
+        out_shape.dims.0[outer] = in_shape.dims.0[inner];
+        out_shape.strides.0[inner] = in_shape.strides.0[outer];
+        out_shape.strides.0[outer] = in_shape.strides.0[inner];
 
-        self.push(Tensor::new(offset, out_shape, inputs, op, false))
+        self.push_weight(offset, out_shape, inputs, op, false)
     }
 
     // Assumes all inputs have the same shape outside of dim
@@ -632,12 +647,12 @@ impl Tape {
         let inputs = Some(View::new(inputs_offset, inputs_len));
         self.inputs.extend_from_slice(a);
 
-        let outer_dims = &self.weights[a[0]].shape.dims[..dim];
-        let outer_len = outer_dims.iter().flatten().product();
+        let outer_dims = &self.weights[a[0]].shape.dims.0[..dim];
+        let outer_len = Dims::product(outer_dims);
         for i in 0..outer_len {
             for b in a.iter().copied() {
-                let inner_dims = &self.weights[b].shape.dims[dim..];
-                let inner_len = inner_dims.iter().flatten().product();
+                let inner_dims = &self.weights[b].shape.dims.0[dim..];
+                let inner_len = Dims::product(inner_dims);
 
                 for k in 0..inner_len {
                     let l_i = i * inner_len + k;
@@ -647,16 +662,16 @@ impl Tape {
             }
         }
 
-        let out_dim = Some(a.iter().copied().fold(0, |acc, next| {
+        let out_dim = a.iter().copied().fold(0, |acc, next| {
             let x_dim = self.weights[next].shape.get_dim(dim);
             acc + x_dim
-        }));
+        });
 
         let mut out_shape = self.weights[a[0]].shape.clone();
-        out_shape.dims[dim] = out_dim;
-        out_shape.strides = get_strides(out_shape.dims);
+        out_shape.dims.0[dim] = out_dim;
+        out_shape.strides = out_shape.dims.strides();
 
-        self.push(Tensor::new(data_offset, out_shape, inputs, op, true))
+        self.push_weight(data_offset, out_shape, inputs, op, true)
     }
 
     // Keeps the dimension if provided
@@ -672,8 +687,8 @@ impl Tape {
         let inner_len = match dim {
             None => 1,
             Some(dim) => {
-                let inner_dims = &a_shape.dims[dim + 1..];
-                inner_dims.iter().flatten().product()
+                let inner_dims = &a_shape.dims.0[dim + 1..];
+                Dims::product(inner_dims)
             }
         };
 
@@ -685,8 +700,8 @@ impl Tape {
         let outer_len = match dim {
             None => 1,
             Some(dim) => {
-                let outer_dims = &a_shape.dims[..dim];
-                outer_dims.iter().flatten().product()
+                let outer_dims = &a_shape.dims.0[..dim];
+                Dims::product(outer_dims)
             }
         };
 
@@ -706,13 +721,13 @@ impl Tape {
             None => Shape::new(&[]),
             Some(dim) => {
                 let mut dims = a_shape.dims.clone();
-                dims[dim] = Some(1);
+                dims.0[dim] = 1;
                 Shape::from_dims(dims)
             }
         };
 
         let inputs = Some(self.push_inputs(&[a]));
-        self.push(Tensor::new(data_offset, shape, inputs, Some(op), true))
+        self.push_weight(data_offset, shape, inputs, Some(op), true)
     }
 
     pub fn sum(&mut self, a: usize, dim: Option<usize>) -> usize {
@@ -762,8 +777,16 @@ impl Tape {
         self.data.copy_within(src, to.offset);
     }
 
-    pub fn push(&mut self, v: Tensor) -> usize {
-        self.weights.push(v);
+    pub fn push_weight(
+        &mut self,
+        offset: usize,
+        shape: Shape,
+        inputs: Option<View>,
+        op: Option<Op>,
+        is_contiguous: bool,
+    ) -> usize {
+        let w = Tensor::new(offset, shape, inputs, op, is_contiguous);
+        self.weights.push(w);
         self.weights.len() - 1
     }
 
@@ -789,10 +812,10 @@ impl Tape {
         let a_batches = a_shape.batches();
         let b_batches = b_shape.batches();
         let out_batches = a_batches.broadcast(b_batches);
-        let batch_count = out_batches.iter().flatten().product();
+        let batch_count = Dims::product(&out_batches.0);
 
-        let a_target = add_dims(out_batches, &[m, k]);
-        let b_target = add_dims(out_batches, &[k, n]);
+        let a_target = out_batches.add(&[m, k]);
+        let b_target = out_batches.add(&[k, n]);
         let a = self.broadcast(a, a_target);
         let b = self.broadcast(b, b_target);
 
@@ -832,10 +855,10 @@ impl Tape {
             }
         }
 
-        let dims = add_dims(out_batches, &[m, n]);
+        let dims = out_batches.add(&[m, n]);
         let out_shape = Shape::from_dims(dims);
         let op = Some(Op::MatMul);
-        self.push(Tensor::new(data_offset, out_shape, inputs, op, true))
+        self.push_weight(data_offset, out_shape, inputs, op, true)
     }
 
     // https://docs.pytorch.org/docs/2.13/generated/torch.matmul.html
@@ -864,7 +887,7 @@ impl Tape {
 
                 let out_shape = Shape::new(&[]);
                 let op = Some(Op::MatMul);
-                self.push(Tensor::new(data_offset, out_shape, inputs, op, true))
+                self.push_weight(data_offset, out_shape, inputs, op, true)
             }
             (1, _) => {
                 let k = a_shape.get_dim(0);
@@ -889,7 +912,7 @@ impl Tape {
         let inputs = Some(self.push_inputs(&[a]));
         let op = Some(Op::Squeeze);
 
-        self.push(Tensor::new(offset, out_shape, inputs, op, false))
+        self.push_weight(offset, out_shape, inputs, op, false)
     }
 
     pub fn add(&mut self, a: usize, b: usize) -> usize {
@@ -909,7 +932,7 @@ impl Tape {
         let mut a_iter = self.weights[a].nditer();
         let mut b_iter = self.weights[b].nditer();
 
-        for _ in 0..in_dims.iter().flatten().product() {
+        for _ in 0..Dims::product(&in_dims.0) {
             let a_i = a_iter.next().unwrap();
             let b_i = b_iter.next().unwrap();
             let s = self.data[a_i] + self.data[b_i];
@@ -918,7 +941,7 @@ impl Tape {
 
         let dims = self.weights[a].shape.dims;
         let shape = Shape::from_dims(dims);
-        self.push(Tensor::new(data_offset, shape, inputs, op, true))
+        self.push_weight(data_offset, shape, inputs, op, true)
     }
 
     pub fn sub(&mut self, a: usize, b: usize) -> usize {
@@ -941,8 +964,8 @@ impl Tape {
             self.data.push(v);
         }
 
-        shape.strides = get_strides(shape.dims);
-        self.push(Tensor::new(data_offset, shape, inputs, op, true))
+        shape.strides = shape.dims.strides();
+        self.push_weight(data_offset, shape, inputs, op, true)
     }
 
     pub fn neg(&mut self, i: usize) -> usize {
@@ -987,7 +1010,7 @@ impl Tape {
         let mut a_iter = self.weights[a].nditer();
         let mut b_iter = self.weights[b].nditer();
 
-        for _ in 0..in_dims.iter().flatten().product() {
+        for _ in 0..Dims::product(&in_dims.0) {
             let a_i = a_iter.next().unwrap();
             let b_i = b_iter.next().unwrap();
             let p = self.data[a_i] * self.data[b_i];
@@ -996,7 +1019,7 @@ impl Tape {
 
         let dims = self.weights[a].shape.dims;
         let shape = Shape::from_dims(dims);
-        self.push(Tensor::new(data_offset, shape, inputs, op, true))
+        self.push_weight(data_offset, shape, inputs, op, true)
     }
 
     pub fn div(&mut self, i: usize, j: usize) -> usize {

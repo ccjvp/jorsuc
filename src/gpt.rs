@@ -1,4 +1,4 @@
-use crate::tape::{Shape, Tape, Tensor};
+use crate::tape::{Shape, Tape};
 use crate::tokenizer::{N_CONTEXT, Tokenizer};
 use rand::distributions::{Distribution, WeightedIndex};
 use rand::thread_rng;
@@ -79,7 +79,7 @@ impl Gpt {
                     tape.data.push(0.0);
                 }
 
-                tape.push(Tensor::new(data_offset, shape, None, None, true));
+                tape.push_weight(data_offset, shape, None, None, true);
             }
         }
 
