@@ -5,8 +5,7 @@ use std::io::BufRead;
 use std::ops::Add;
 
 pub const N_CONTEXT: usize = 64;
-// TODO: N_TOKENS instead of N_RULES
-const N_RULES: usize = 4096;
+const N_TOKENS: usize = 255;
 const N_CHARS: usize = 6;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -154,7 +153,9 @@ impl Tokenizer {
         }
     }
 
-    fn learn_rules(&mut self) {
+    fn get_vocab(&mut self) -> Vec<Token> {
+        let mut vocab = HashSet::new();
+
         while let Some(rule) = &self.heap.pop() {
             let freq = rule.0;
             let pair = rule.1;
@@ -169,10 +170,15 @@ impl Tokenizer {
                 self.merge_pair(pair, true);
             }
 
-            if self.rules.len() == N_RULES {
+            vocab.insert(pair.0);
+            vocab.insert(pair.1);
+            vocab.insert(pair.0 + pair.1);
+            if vocab.len() == N_TOKENS {
                 break;
             }
         }
+
+        vocab.into_iter().collect()
     }
 
     fn reset_scratch(&mut self) {
@@ -215,20 +221,6 @@ impl Tokenizer {
         out.push(self.bos)
     }
 
-    fn get_vocab(&self) -> Vec<Token> {
-        let mut vocab: Vec<_> = self
-            .rules
-            .keys()
-            .copied()
-            .flat_map(|(a, b)| [a, b, a + b])
-            .collect();
-
-        vocab.sort();
-        vocab.dedup();
-
-        vocab
-    }
-
     fn get_encoder(&self) -> HashMap<Token, usize> {
         self.vocab
             .iter()
@@ -255,8 +247,6 @@ impl Tokenizer {
             self.heap.push((freq, *p.0));
         }
 
-        self.learn_rules();
-
         self.vocab = self.get_vocab();
         self.encoder = self.get_encoder();
         self.bos = self.vocab.len();
@@ -270,7 +260,7 @@ impl Tokenizer {
         let vocab = vec![];
         let encoder = HashMap::new();
         let pairs = HashMap::new();
-        let rules = HashMap::with_capacity(N_RULES);
+        let rules = HashMap::new();
         let heap = BinaryHeap::new();
 
         Self {

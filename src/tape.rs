@@ -298,7 +298,6 @@ impl Tensor {
         }
     }
 
-    // TODO: Optimize further or move out of hot path in bmm
     pub fn offset(self, i: usize) -> usize {
         if self.is_contiguous {
             self.offset + i
