@@ -7,9 +7,9 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::time::Instant;
 use std::{fs, vec};
 
-const D_MODEL: usize = 64;
+const D_MODEL: usize = 256;
 const N_HEAD: usize = 4;
-const N_LAYER: usize = 6;
+const N_LAYER: usize = 2;
 const HEAD_DIM: usize = D_MODEL / N_HEAD;
 const TRAINING_STEPS: usize = 100;
 const N_SAMPLES: usize = 16;

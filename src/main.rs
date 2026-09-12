@@ -1,5 +1,6 @@
 mod dims;
 mod gpt;
+mod gpu;
 mod shape;
 mod tape;
 mod tokenizer;

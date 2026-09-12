@@ -1,5 +1,7 @@
 use crate::dims::Dims;
+use crate::gpu::Gpu;
 use crate::shape::Shape;
+use pollster::FutureExt;
 use rand::distributions::Distribution;
 use rand::distributions::Uniform;
 
@@ -608,7 +610,6 @@ impl Tape {
         let a_batches = a_shape.batches();
         let b_batches = b_shape.batches();
         let out_batches = a_batches.broadcast(b_batches);
-        let batch_count = Dims::product(&out_batches.0);
 
         let a_target = out_batches.add(&[m, k]);
         let b_target = out_batches.add(&[k, n]);
@@ -620,6 +621,11 @@ impl Tape {
         self.inputs.push(a);
         self.inputs.push(b);
 
+        let gpu = Gpu::get();
+        gpu.bmm(self, a, b).block_on().unwrap();
+
+        /*
+        let batch_count = Dims::product(&out_batches.0);
         let a_offset = self.weights[a].offset;
         let b_offset = self.weights[b].offset;
         let iter_shape = Shape::from_dims(out_batches);
@@ -649,7 +655,7 @@ impl Tape {
 
                 self.data.push(dot);
             }
-        }
+        }*/
 
         let dims = out_batches.add(&[m, n]);
         let out_shape = Shape::from_dims(dims);
@@ -947,7 +953,7 @@ mod tests {
                 let tolerance = 1e-5 * expected.abs().max(actual.abs()).max(1.0);
                 let diff = (expected - actual).abs();
 
-                assert!(diff <= tolerance);
+                assert!(diff <= tolerance, "diff: {diff}, tolerance: {tolerance}");
             }
         }
 

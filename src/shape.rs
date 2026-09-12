@@ -151,6 +151,20 @@ impl Shape {
         }
     }
 
+    pub fn span(&self) -> usize {
+        let dim_iter = self.dims.0.iter();
+        let stride_iter = self.strides.0.iter();
+
+        let max_offset = dim_iter
+            .zip(stride_iter)
+            .take_while(|&(&dim, _)| dim != 0)
+            .map(|(&dim, &stride)| (dim - 1) * stride)
+            .sum::<usize>();
+
+        // Zero based offset is off by one
+        max_offset + 1
+    }
+
     pub fn product(&self) -> usize {
         Dims::product(&self.dims.0)
     }

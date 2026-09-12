@@ -4,10 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0.104"
+bytemuck = "1.25.2"
+pollster = "1.0.1"
 pyo3 = "0.29.2"
 quickcheck = "1.1.0"
 quickcheck_macros = "1.2.0"
 rand= "0.8"
+wgpu = "30.0.1"
 
 [profile.release]
 debug = "line-tables-only"

@@ -5,7 +5,7 @@ use std::io::BufRead;
 use std::ops::Add;
 
 pub const N_CONTEXT: usize = 64;
-const N_TOKENS: usize = 255;
+const N_TOKENS: usize = 2048;
 const N_CHARS: usize = 6;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -156,6 +156,11 @@ impl Tokenizer {
     fn get_vocab(&mut self) -> Vec<Token> {
         let mut vocab = HashSet::new();
 
+        let mut insert = |token| {
+            vocab.insert(token);
+            vocab.len() == N_TOKENS
+        };
+
         while let Some(rule) = &self.heap.pop() {
             let freq = rule.0;
             let pair = rule.1;
@@ -170,10 +175,15 @@ impl Tokenizer {
                 self.merge_pair(pair, true);
             }
 
-            vocab.insert(pair.0);
-            vocab.insert(pair.1);
-            vocab.insert(pair.0 + pair.1);
-            if vocab.len() == N_TOKENS {
+            if insert(pair.0) {
+                break;
+            }
+
+            if insert(pair.1) {
+                break;
+            }
+
+            if insert(pair.0 + pair.1) {
                 break;
             }
         }
