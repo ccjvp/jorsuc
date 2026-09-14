@@ -1,6 +1,7 @@
 use crate::dims::Dims;
 use crate::gpu::Gpu;
 use crate::shape::Shape;
+use clap::ValueEnum;
 use pollster::FutureExt;
 use rand::distributions::Distribution;
 use rand::distributions::Uniform;
@@ -87,19 +88,31 @@ impl Tensor {
     }
 }
 
+#[allow(dead_code)]
+#[derive(PartialEq, Eq, Clone, Copy, ValueEnum)]
+pub enum Device {
+    Cpu,
+    Gpu,
+}
+
 pub struct Tape {
     pub weights: Vec<Tensor>,
     pub data: Vec<f32>,
     pub inputs: Vec<usize>,
+    pub device: Device,
 }
 
-// TODO: Numerical tests using generated data
 impl Tape {
-    pub fn new() -> Self {
+    pub fn new(device: Device) -> Self {
+        if device == Device::Gpu {
+            println!("Only matmul supports GPU. Other ops falling back to Cpu.")
+        }
+
         Self {
             weights: vec![],
             data: vec![],
             inputs: vec![],
+            device: device,
         }
     }
 
@@ -621,41 +634,42 @@ impl Tape {
         self.inputs.push(a);
         self.inputs.push(b);
 
-        let gpu = Gpu::get();
-        gpu.bmm(self, a, b).block_on().unwrap();
+        if self.device == Device::Gpu {
+            let gpu = Gpu::get();
+            gpu.bmm(self, a, b).block_on().unwrap();
+        } else {
+            let batch_count = Dims::product(&out_batches.0);
+            let a_offset = self.weights[a].offset;
+            let b_offset = self.weights[b].offset;
+            let iter_shape = Shape::from_dims(out_batches);
+            let mut a_batch_iter = iter_shape.nditer(a_offset);
+            let mut b_batch_iter = iter_shape.nditer(b_offset);
 
-        /*
-        let batch_count = Dims::product(&out_batches.0);
-        let a_offset = self.weights[a].offset;
-        let b_offset = self.weights[b].offset;
-        let iter_shape = Shape::from_dims(out_batches);
-        let mut a_batch_iter = iter_shape.nditer(a_offset);
-        let mut b_batch_iter = iter_shape.nditer(b_offset);
+            for _ in 0..batch_count {
+                let a_batch_offset = a_batch_iter.next().unwrap();
+                let b_batch_offset = b_batch_iter.next().unwrap();
 
-        for _ in 0..batch_count {
-            let a_batch_offset = a_batch_iter.next().unwrap();
-            let b_batch_offset = b_batch_iter.next().unwrap();
+                for i in 0..m * n {
+                    let row = i / n;
+                    let col = i % n;
 
-            for i in 0..m * n {
-                let row = i / n;
-                let col = i % n;
+                    let mut dot = 0.0;
+                    for j in 0..k {
+                        let row_offset = row * a_shape.get_stride(-2);
+                        let a_offset = row_offset + j * a_shape.get_stride(-1);
+                        let a_data = self.data[a_batch_offset + a_offset];
 
-                let mut dot = 0.0;
-                for j in 0..k {
-                    let row_offset = row * a_shape.get_stride(-2);
-                    let a_offset = row_offset + j * a_shape.get_stride(-1);
-                    let a_data = self.data[a_batch_offset + a_offset];
+                        let col_offset = col * b_shape.get_stride(-1);
+                        let b_offset = col_offset + j * b_shape.get_stride(-2);
+                        let b_data = self.data[b_batch_offset + b_offset];
 
-                    let col_offset = col * b_shape.get_stride(-1);
-                    let b_offset = col_offset + j * b_shape.get_stride(-2);
-                    let b_data = self.data[b_batch_offset + b_offset];
+                        dot += a_data * b_data;
+                    }
 
-                    dot += a_data * b_data;
+                    self.data.push(dot);
                 }
-
-                self.data.push(dot);
             }
-        }*/
+        }
 
         let dims = out_batches.add(&[m, n]);
         let out_shape = Shape::from_dims(dims);
@@ -832,10 +846,15 @@ impl Tape {
 
 #[cfg(test)]
 mod tests {
-    use crate::{dims::Dims, shape::Shape, tape::Tape};
+    use crate::{
+        dims::Dims,
+        shape::Shape,
+        tape::{Device, Tape},
+    };
     use pyo3::{PyResult, prelude::*, types::PyDict};
     use quickcheck::{Arbitrary, Gen, TestResult};
     use quickcheck_macros::quickcheck;
+    use rand::Rng;
     use std::sync::Once;
 
     static PYTHON_INIT: Once = Once::new();
@@ -972,7 +991,7 @@ mod tests {
             let a = tensor(&torch, &data.a, &data.shape)?;
             let x = a.call_method0(method)?;
 
-            let mut tape = Tape::new();
+            let mut tape = Tape::new(Device::Cpu);
             let a = tape.tensor(&data.a);
             let y = tape_op(&mut tape, a);
 
@@ -993,7 +1012,7 @@ mod tests {
             let b = tensor(&torch, &data.b, &data.shape)?;
             let x = a.call_method1(method, (&b,))?;
 
-            let mut tape = Tape::new();
+            let mut tape = Tape::new(Device::Cpu);
             let a = tape.tensor(&data.a);
             let b = tape.tensor(&data.b);
             let y = tape_op(&mut tape, a, b);
@@ -1076,7 +1095,7 @@ mod tests {
             let a = tensor(&torch, &data.a[..], shape)?;
             let x = a.call_method1("sum", (1, true))?;
 
-            let mut tape = Tape::new();
+            let mut tape = Tape::new(Device::Cpu);
             let a = tape.tensor(&data.a);
             let a = tape.reshape(a, Shape::new(shape));
             let y = tape.sum(a, Some(1));
@@ -1096,7 +1115,7 @@ mod tests {
             let args = (vec![2, data.a.len()],);
             let x = a.call_method1("expand", args)?;
 
-            let mut tape = Tape::new();
+            let mut tape = Tape::new(Device::Cpu);
             let a = tape.tensor(&data.a);
             let a = tape.reshape(a, Shape::new(from));
             let to = Dims([2, data.a.len(), 0, 0]);
@@ -1116,7 +1135,7 @@ mod tests {
             let a = tensor(&torch, &values, &[2, data.a.len()])?;
             let x = a.call_method1("select", (0, 1))?;
 
-            let mut tape = Tape::new();
+            let mut tape = Tape::new(Device::Cpu);
             let a = tape.tensor(&values);
             let a = tape.reshape(a, Shape::new(&[2, data.a.len()]));
             let y = tape.select(a, 0, 1);
@@ -1138,7 +1157,7 @@ mod tests {
             let scale = mean.call_method1("pow", (-0.5,))?;
             let x = a.call_method1("mul", (&scale,))?;
 
-            let mut tape = Tape::new();
+            let mut tape = Tape::new(Device::Cpu);
             let a = tape.tensor(&data.a);
             let a = tape.reshape(a, Shape::new(&data.shape));
             let y = tape.rmsnorm(a);
@@ -1156,7 +1175,7 @@ mod tests {
             let a = tensor(&torch, &data.a, &data.shape)?;
             let x = a.call_method1("softmax", (-1,))?;
 
-            let mut tape = Tape::new();
+            let mut tape = Tape::new(Device::Cpu);
             let a = tape.tensor(&data.a);
             let a = tape.reshape(a, Shape::new(&data.shape));
             let y = tape.softmax(a);
@@ -1175,7 +1194,7 @@ mod tests {
             let a = tensor(&torch, &data.a, &[data.a.len()])?;
             let x = a.call_method1("reshape", (to.to_vec(),))?;
 
-            let mut tape = Tape::new();
+            let mut tape = Tape::new(Device::Cpu);
             let a = tape.tensor(&data.a);
             let y = tape.reshape(a, Shape::new(&to));
 
@@ -1192,7 +1211,7 @@ mod tests {
             let a = tensor(&torch, &data.a, &[2, 3])?;
             let x = a.call_method1("transpose", (0, 1))?;
 
-            let mut tape = Tape::new();
+            let mut tape = Tape::new(Device::Cpu);
             let a = tape.tensor(&data.a);
             let a = tape.reshape(a, Shape::new(&[2, 3]));
             let y = tape.transpose(a, 0, 1);
@@ -1211,7 +1230,15 @@ mod tests {
             let b = tensor(&torch, &data.b, &[3, 2])?;
             let x = a.call_method1("matmul", (&b,))?;
 
-            let mut tape = Tape::new();
+            let mut rng = rand::thread_rng();
+
+            let device = if rng.gen_range(0..=1) == 0 {
+                Device::Cpu
+            } else {
+                Device::Gpu
+            };
+
+            let mut tape = Tape::new(device);
             let a = tape.tensor(&data.a);
             let a = tape.reshape(a, Shape::new(&[2, 3]));
             let b = tape.tensor(&data.b);
@@ -1257,7 +1284,7 @@ mod tests {
             loss.call_method0("backward")?;
             let expected = flat_list(x.getattr("grad")?)?;
 
-            let mut tape = Tape::new();
+            let mut tape = Tape::new(Device::Cpu);
             let source = tape.scalar(data.a[0]);
             let expanded = tape.broadcast(source, Shape::new(&shape).dims);
             let input = tape.tensor(&data.a);

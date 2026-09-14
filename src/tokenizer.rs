@@ -4,8 +4,6 @@ use std::hash::Hash;
 use std::io::BufRead;
 use std::ops::Add;
 
-pub const N_CONTEXT: usize = 64;
-const N_TOKENS: usize = 2048;
 const N_CHARS: usize = 6;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -57,6 +55,7 @@ pub struct Tokenizer {
     pub pairs: HashMap<(Token, Token), HashSet<usize>>,
     pub heap: BinaryHeap<(usize, (Token, Token))>,
     pub bos: usize,
+    pub n_tokens: usize,
 }
 
 impl Tokenizer {
@@ -155,10 +154,11 @@ impl Tokenizer {
 
     fn get_vocab(&mut self) -> Vec<Token> {
         let mut vocab = HashSet::new();
+        let n_tokens = self.n_tokens;
 
         let mut insert = |token| {
             vocab.insert(token);
-            vocab.len() == N_TOKENS
+            vocab.len() == n_tokens
         };
 
         while let Some(rule) = &self.heap.pop() {
@@ -262,7 +262,7 @@ impl Tokenizer {
         self.bos = self.vocab.len();
     }
 
-    pub fn new() -> Self {
+    pub fn new(n_tokens: usize) -> Self {
         let sequence = vec![];
         let prev = vec![];
         let next = vec![];
@@ -284,6 +284,8 @@ impl Tokenizer {
             rules,
             heap,
             bos: 0,
+            // Reserve one for BOS
+            n_tokens: n_tokens - 1,
         }
     }
 }

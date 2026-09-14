@@ -1,22 +1,12 @@
+use crate::Args;
 use crate::shape::Shape;
 use crate::tape::Tape;
-use crate::tokenizer::{N_CONTEXT, Tokenizer};
+use crate::tokenizer::Tokenizer;
 use rand::distributions::{Distribution, WeightedIndex};
 use rand::thread_rng;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::time::Instant;
-use std::{fs, vec};
-
-const D_MODEL: usize = 256;
-const N_HEAD: usize = 4;
-const N_LAYER: usize = 2;
-const HEAD_DIM: usize = D_MODEL / N_HEAD;
-const TRAINING_STEPS: usize = 100;
-const N_SAMPLES: usize = 16;
-const LEARNING_RATE: f32 = 0.01;
-const BETA_1: f32 = 0.85;
-const BETA_2: f32 = 0.99;
-const EPS_ADAM: f32 = 1e-8;
+use std::{fs, usize, vec};
 
 struct Layer {
     attn_wq: usize,
@@ -28,18 +18,18 @@ struct Layer {
 }
 
 impl Layer {
-    fn new(tape: &mut Tape, n_embed: usize) -> Self {
+    fn new(tape: &mut Tape, d_model: usize, n_layer: usize) -> Self {
         // GPT-2 trick to stop the residual stream's standard deviation
         // from growing with depth at initialization
-        let wo_fc2_scale = 1.0 / (2.0 * N_LAYER as f32).sqrt();
-        let attn_shape = &[n_embed, n_embed];
+        let wo_fc2_scale = 1.0 / (2.0 * n_layer as f32).sqrt();
+        let attn_shape = &[d_model, d_model];
         let attn_wq = tape.random(attn_shape, 1.0);
         let attn_wk = tape.random(attn_shape, 1.0);
         let attn_wv = tape.random(attn_shape, 1.0);
         let attn_wo = tape.random(attn_shape, wo_fc2_scale);
 
-        let mlp_fc1 = tape.random(&[n_embed, n_embed * 4], 1.0);
-        let mlp_fc2 = tape.random(&[n_embed * 4, n_embed], wo_fc2_scale);
+        let mlp_fc1 = tape.random(&[d_model, d_model * 4], 1.0);
+        let mlp_fc2 = tape.random(&[d_model * 4, d_model], wo_fc2_scale);
 
         Self {
             attn_wq,
@@ -56,16 +46,19 @@ pub struct Gpt {
     wte: usize,
     lm_head: usize,
     layers: Vec<Layer>,
-    pub n_weights: usize,
     pub n_params: usize,
+    pub n_weights: usize,
+    pub args: Args,
 }
 
 impl Gpt {
-    pub fn new(tape: &mut Tape, tokenizer: &Tokenizer) -> Self {
+    pub fn new(tape: &mut Tape, tokenizer: &Tokenizer, args: Args) -> Self {
+        let d_model = args.d_model;
+        let n_layer = args.n_layer;
         let vocab_size = tokenizer.vocab.len() + 1;
-        let wte = tape.random(&[vocab_size, D_MODEL], 1.0);
-        let lm_head = tape.random(&[D_MODEL, vocab_size], 1.0);
-        let layers = Vec::from_iter((0..N_LAYER).map(|_| Layer::new(tape, D_MODEL)));
+        let wte = tape.random(&[vocab_size, d_model], 1.0);
+        let lm_head = tape.random(&[d_model, vocab_size], 1.0);
+        let layers = Vec::from_iter((0..n_layer).map(|_| Layer::new(tape, d_model, n_layer)));
         let n_params = tape.data.len();
         let n_weights = tape.weights.len();
 
@@ -90,6 +83,7 @@ impl Gpt {
             layers,
             n_params,
             n_weights,
+            args,
         }
     }
 
@@ -160,13 +154,15 @@ impl Gpt {
     }
 
     fn forward(&mut self, tape: &mut Tape, tokenizer: &Tokenizer, token_ids: &[usize]) -> usize {
-        // Score standard deviation grows roughly with sqrt(head_dim)
-        let head_dim = tape.scalar(HEAD_DIM as f32);
-        let score_scale = tape.pow(head_dim, 0.5);
+        let head_dim = self.args.d_model / self.args.n_head;
         let seq_len = token_ids.len();
-        let head_shape = Shape::new(&[1, N_HEAD, seq_len, HEAD_DIM]);
+        let head_shape = Shape::new(&[1, self.args.n_head, seq_len, head_dim]);
+
+        // Score standard deviation grows roughly with sqrt(head_dim)
+        let head_dim_w = tape.scalar(head_dim as f32);
+        let score_scale = tape.pow(head_dim_w, 0.5);
         let causal_mask = Self::causal_mask(tape, seq_len);
-        let out_shape = Shape::new(&[seq_len, D_MODEL]);
+        let out_shape = Shape::new(&[seq_len, self.args.d_model]);
 
         let mut x = self.embedding(tape, tokenizer, token_ids);
         x = tape.rmsnorm(x);
@@ -229,7 +225,7 @@ impl Gpt {
         let num_lines = offsets.len();
         let mut token_ids = vec![];
 
-        for step in 0..TRAINING_STEPS {
+        for step in 0..self.args.n_steps {
             let start = Instant::now();
             let offset = offsets[step % num_lines];
             file.seek(SeekFrom::Start(offset)).unwrap_or_else(|e| {
@@ -255,17 +251,17 @@ impl Gpt {
 
             // Linear learning rate decay
             let stepf = step as f32;
-            let stepsf = TRAINING_STEPS as f32;
-            let lr_t = tape.scalar(LEARNING_RATE * (1.0 - (stepf / stepsf)));
-            let eps_adam = tape.scalar(EPS_ADAM);
+            let stepsf = self.args.n_steps as f32;
+            let lr_t = tape.scalar(self.args.learning_rate * (1.0 - (stepf / stepsf)));
+            let eps_adam = tape.scalar(self.args.eps_adam);
             let one = tape.scalar(1.0);
 
-            let b1 = tape.scalar(BETA_1);
+            let b1 = tape.scalar(self.args.beta_1);
             let b1_complement = tape.sub(one, b1);
             let m_pow = tape.pow(b1, stepf + 1.0);
             let m_numerator = tape.sub(one, m_pow);
 
-            let b2 = tape.scalar(BETA_2);
+            let b2 = tape.scalar(self.args.beta_2);
             let b2_complement = tape.sub(one, b2);
             let v_pow = tape.pow(b2, stepf + 1.0);
             let v_numerator = tape.sub(one, v_pow);
@@ -300,7 +296,7 @@ impl Gpt {
                 }
             }
 
-            let w = TRAINING_STEPS.to_string().len();
+            let w = self.args.n_steps.to_string().len();
             let elapsed = start.elapsed();
 
             println!(
@@ -308,7 +304,7 @@ impl Gpt {
                 elapsed.as_secs(),
                 elapsed.subsec_millis(),
                 step,
-                TRAINING_STEPS,
+                self.args.n_steps,
                 loss_f,
                 w = w
             );
@@ -318,11 +314,11 @@ impl Gpt {
     }
 
     pub fn infer(&mut self, tape: &mut Tape, tokenizer: &mut Tokenizer) {
-        for _ in 0..N_SAMPLES {
+        for _ in 0..self.args.n_samples {
             let mut rng = thread_rng();
             let mut token_ids = vec![tokenizer.bos];
 
-            for _ in 0..N_CONTEXT {
+            for _ in 0..self.args.n_context {
                 let logits = self.forward(tape, tokenizer, &token_ids);
                 let logits = tape.select(logits, 0, token_ids.len() - 1);
                 let probs = tape.softmax(logits);
