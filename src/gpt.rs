@@ -5,6 +5,7 @@ use crate::tokenizer::Tokenizer;
 use rand::distributions::{Distribution, WeightedIndex};
 use rand::thread_rng;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::path::PathBuf;
 use std::time::Instant;
 use std::{fs, usize, vec};
 
@@ -154,9 +155,10 @@ impl Gpt {
     }
 
     fn forward(&mut self, tape: &mut Tape, tokenizer: &Tokenizer, token_ids: &[usize]) -> usize {
-        let head_dim = self.args.d_model / self.args.n_head;
+        let n_head = self.args.n_head;
+        let head_dim = self.args.d_model / n_head;
         let seq_len = token_ids.len();
-        let head_shape = Shape::new(&[1, self.args.n_head, seq_len, head_dim]);
+        let head_shape = Shape::new(&[1, seq_len, n_head, head_dim]);
 
         // Score standard deviation grows roughly with sqrt(head_dim)
         let head_dim_w = tape.scalar(head_dim as f32);
@@ -173,12 +175,15 @@ impl Gpt {
 
             let k = tape.matmul(x, layer.attn_wk);
             let k = tape.reshape(k, head_shape);
+            let k = tape.transpose(k, -3, -2);
 
             let v = tape.matmul(x, layer.attn_wv);
             let v = tape.reshape(v, head_shape);
+            let v = tape.transpose(v, -3, -2);
 
             let q = tape.matmul(x, layer.attn_wq);
             let q = tape.reshape(q, head_shape);
+            let q = tape.transpose(q, -3, -2);
 
             let k_t = tape.transpose(k, -2, -1);
             let mut scores = tape.matmul(q, k_t);
@@ -210,7 +215,7 @@ impl Gpt {
         tape.matmul(x, self.lm_head)
     }
 
-    pub fn train(&mut self, tape: &mut Tape, tokenizer: &mut Tokenizer, path: &str) {
+    pub fn train(&mut self, tape: &mut Tape, tokenizer: &mut Tokenizer, path: &PathBuf) {
         let mut file = fs::File::open(path).expect("Input file not found");
         let reader = std::io::BufReader::new(&file);
 

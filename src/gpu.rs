@@ -175,8 +175,8 @@ impl Gpu {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
 
-        let num_dispatches = output_len.div_ceil(64) as u32;
-        pass.dispatch_workgroups(num_dispatches, 1, 1);
+        let n_dispatches = output_len.div_ceil(64).min(65535) as u32;
+        pass.dispatch_workgroups(n_dispatches, 1, 1);
         drop(pass);
 
         encoder.copy_buffer_to_buffer(&output, 0, &temp, 0, output.size());

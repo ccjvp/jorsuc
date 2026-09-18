@@ -3,8 +3,9 @@ use std::fs;
 use std::hash::Hash;
 use std::io::BufRead;
 use std::ops::Add;
+use std::path::PathBuf;
 
-const N_CHARS: usize = 6;
+const N_CHARS: usize = 32;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct Token {
@@ -27,7 +28,9 @@ impl Add for Token {
         let mut bytes = self.bytes;
 
         let mut j = 0;
-        for i in 0..N_CHARS {
+        for i in 0.. {
+            assert!(i < N_CHARS && j < N_CHARS);
+
             if self.bytes[i].is_some() {
                 continue;
             }
@@ -240,7 +243,7 @@ impl Tokenizer {
             .collect()
     }
 
-    pub fn train(&mut self, path: &str) {
+    pub fn train(&mut self, path: &PathBuf) {
         let file = fs::File::open(path).expect("Input file not found");
         let reader = std::io::BufReader::new(file);
 
